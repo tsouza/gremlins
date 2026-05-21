@@ -9,10 +9,10 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 
-	"github.com/go-gremlins/gremlins/internal/configuration"
-	"github.com/go-gremlins/gremlins/internal/log"
-	"github.com/go-gremlins/gremlins/internal/mutator"
-	"github.com/go-gremlins/gremlins/internal/report"
+	"github.com/tsouza/gremlins/internal/configuration"
+	"github.com/tsouza/gremlins/internal/log"
+	"github.com/tsouza/gremlins/internal/mutator"
+	"github.com/tsouza/gremlins/internal/report"
 )
 
 func Test_parseFilter(t *testing.T) {

@@ -25,7 +25,7 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/go-gremlins/gremlins/internal/mutator"
+	"github.com/tsouza/gremlins/internal/mutator"
 )
 
 // TokenMutator is a mutator.Mutator of a token.Token.

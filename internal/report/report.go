@@ -27,11 +27,11 @@ import (
 	"github.com/fatih/color"
 	"github.com/hako/durafmt"
 
-	"github.com/go-gremlins/gremlins/internal/configuration"
-	"github.com/go-gremlins/gremlins/internal/execution"
-	"github.com/go-gremlins/gremlins/internal/log"
-	"github.com/go-gremlins/gremlins/internal/mutator"
-	"github.com/go-gremlins/gremlins/internal/report/internal"
+	"github.com/tsouza/gremlins/internal/configuration"
+	"github.com/tsouza/gremlins/internal/execution"
+	"github.com/tsouza/gremlins/internal/log"
+	"github.com/tsouza/gremlins/internal/mutator"
+	"github.com/tsouza/gremlins/internal/report/internal"
 )
 
 var (
