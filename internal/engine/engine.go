@@ -98,6 +98,13 @@ func WithDirFs(dirFS fs.FS) Option {
 // It walks the fs.FS provided and checks every .go file which is not a test.
 // For each file it will scan for tokenMutations and gather all the mutants found.
 func (mu *Engine) Run(ctx context.Context) report.Results {
+	// If the dealer is the standard MutantExecutorDealer, hand it the run
+	// context so that in-flight mutants can be marked correctly when the
+	// runner cancels (e.g. SIGTERM at job timeout) instead of falling
+	// through to the default Lived branch.
+	if d, ok := mu.jDealer.(*MutantExecutorDealer); ok {
+		d.SetRunCtx(ctx)
+	}
 	mu.mutantStream = make(chan mutator.Mutator)
 	go func() {
 		defer close(mu.mutantStream)

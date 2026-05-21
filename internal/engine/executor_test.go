@@ -442,6 +442,90 @@ func TestProcessBuildFailure(_ *testing.T) {
 	os.Exit(2) // skipcq: RVV-A0003
 }
 
+// TestProcessSleep is the child-process entry point used by the
+// SIGTERM-shutdown tests: it sleeps long enough that the parent ctx
+// will cancel it. ExecCommandContext kills the process tree on ctx
+// cancellation, so this child will exit non-zero (signal kill) and
+// the parent ctx.Err() will be non-nil.
+func TestProcessSleep(_ *testing.T) {
+	if os.Getenv("GO_TEST_PROCESS") != "1" {
+		return
+	}
+	time.Sleep(30 * time.Second)
+	os.Exit(0) // skipcq: RVV-A0003 — only reached if no one cancels us
+}
+
+func fakeExecCommandSleep(ctx context.Context, command string, args ...string) *exec.Cmd {
+	cs := []string{"-test.run=TestProcessSleep", "--", command}
+	cs = append(cs, args...)
+	return getCmd(ctx, cs)
+}
+
+// TestShutdownMidRun pins the fix for the bug where a SIGTERM from a CI
+// runner during `gremlins unleash` caused mutants that were still being
+// tested to be recorded as LIVED. The expected behaviour now: when the
+// engine's root ctx is cancelled mid-run, in-flight mutants are reported
+// with the status configured via --on-shutdown-status (default
+// not-run -> mutator.NotCovered), never LIVED.
+func TestShutdownMidRun(t *testing.T) {
+	cases := []struct {
+		name       string
+		flagValue  string
+		wantStatus mutator.Status
+	}{
+		{name: "default not-run maps to NotCovered", flagValue: "not-run", wantStatus: mutator.NotCovered},
+		{name: "timed-out maps to TimedOut", flagValue: "timed-out", wantStatus: mutator.TimedOut},
+		{name: "lived preserves legacy behaviour for opt-in", flagValue: "lived", wantStatus: mutator.Lived},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			viperSet(map[string]any{
+				configuration.UnleashDryRunKey:           false,
+				configuration.UnleashOnShutdownStatusKey: tc.flagValue,
+			})
+			defer viperReset()
+
+			wdDealer := newWdDealerStub(t)
+			mod := gomodule.GoModule{Name: "example.com", Root: ".", CallingDir: "."}
+			mjd := engine.NewExecutorDealer(mod, wdDealer, expectedTimeout,
+				engine.WithExecContext(fakeExecCommandSleep),
+			)
+			runCtx, cancel := context.WithCancel(context.Background())
+			mjd.SetRunCtx(runCtx)
+
+			mut := &mutantStub{
+				status:  mutator.Runnable,
+				mutType: mutator.ConditionalsBoundary,
+				pkg:     "example.com",
+			}
+			outCh := make(chan mutator.Mutator, 1)
+			wg := sync.WaitGroup{}
+			wg.Add(1)
+			executor := mjd.NewExecutor(mut, outCh, &wg)
+			w := &workerpool.Worker{Name: "test", ID: 1}
+
+			// Cancel the run a short moment after the executor starts, so
+			// the test subprocess is killed mid-flight.
+			go func() {
+				time.Sleep(100 * time.Millisecond)
+				cancel()
+			}()
+			executor.Start(w)
+			wg.Wait()
+
+			select {
+			case got := <-outCh:
+				if got.Status() != tc.wantStatus {
+					t.Fatalf("shutdown-mid-run: want %v, got %v", tc.wantStatus, got.Status())
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("executor never wrote to outCh")
+			}
+		})
+	}
+}
+
 func TestMutatorRunInTheCorrectFolder(t *testing.T) {
 	t.Run("mutation should run in the correct folder", func(t *testing.T) {
 		callingDir := "test/dir"

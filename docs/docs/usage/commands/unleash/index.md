@@ -456,6 +456,26 @@ gremlins unleash --timeout-coefficient=10
     indicate an issue.
 [//]: # (@formatter:on)
 
+### On-shutdown status
+
+:material-flag: `--on-shutdown-status` · :material-sign-direction: Default: `not-run`
+
+Controls the `Status` recorded for mutants that were still in-flight when the run was cancelled
+(e.g. `SIGTERM` from a CI runner that hit its job timeout, or Ctrl-C from the terminal).
+
+Allowed values:
+
+- `not-run` (default) — record cancelled-in-flight mutants as `NOT COVERED`. Truthful: they were
+  never observed.
+- `timed-out` — record them as `TIMED OUT`. Useful if you want test-efficacy
+  (`KILLED / (KILLED + LIVED)`) to ignore them.
+- `lived` — legacy behaviour: record them as `LIVED`. Available for backwards compatibility,
+  but misleading — these mutants were not tested, so they should not be counted as survivors.
+
+```shell
+gremlins unleash --on-shutdown-status=timed-out
+```
+
 ### Workers
 
 :material-flag: `--workers` · :material-sign-direction: Default: `0`

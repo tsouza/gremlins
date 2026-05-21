@@ -59,6 +59,7 @@ const (
 	paramTestCPU            = "test-cpu"
 	paramWorkers            = "workers"
 	paramTimeoutCoefficient = "timeout-coefficient"
+	paramOnShutdownStatus   = "on-shutdown-status"
 
 	// Thresholds.
 	paramThresholdEfficacy  = "threshold-efficacy"
@@ -220,6 +221,7 @@ func setFlagsOnCmd(cmd *cobra.Command) error {
 		{Name: paramWorkers, CfgKey: configuration.UnleashWorkersKey, DefaultV: 0, Usage: "the number of workers to use in mutation testing"},
 		{Name: paramTestCPU, CfgKey: configuration.UnleashTestCPUKey, DefaultV: 0, Usage: "the number of CPUs to allow each test run to use"},
 		{Name: paramTimeoutCoefficient, CfgKey: configuration.UnleashTimeoutCoefficientKey, DefaultV: 0, Usage: "the coefficient by which the timeout is increased"},
+		{Name: paramOnShutdownStatus, CfgKey: configuration.UnleashOnShutdownStatusKey, DefaultV: "not-run", Usage: "status to record for in-flight mutants when the run is cancelled (e.g. SIGTERM from a CI runner); one of 'not-run', 'timed-out', 'lived'"},
 	}
 
 	for _, f := range fls {

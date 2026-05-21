@@ -71,6 +71,36 @@ func TestStatusString(t *testing.T) {
 	}
 }
 
+func TestParseShutdownStatus(t *testing.T) {
+	cases := []struct {
+		in     string
+		want   mutator.Status
+		wantOK bool
+	}{
+		{in: "not-run", want: mutator.NotCovered, wantOK: true},
+		{in: "notrun", want: mutator.NotCovered, wantOK: true},
+		{in: "", want: mutator.NotCovered, wantOK: true},
+		{in: "timed-out", want: mutator.TimedOut, wantOK: true},
+		{in: "timedout", want: mutator.TimedOut, wantOK: true},
+		{in: "timeout", want: mutator.TimedOut, wantOK: true},
+		{in: "lived", want: mutator.Lived, wantOK: true},
+		{in: "garbage", wantOK: false},
+		{in: "KILLED", wantOK: false},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.in, func(t *testing.T) {
+			got, ok := mutator.ParseShutdownStatus(tc.in)
+			if ok != tc.wantOK {
+				t.Fatalf("ok: want %v, got %v", tc.wantOK, ok)
+			}
+			if ok && got != tc.want {
+				t.Fatalf("status: want %v, got %v", tc.want, got)
+			}
+		})
+	}
+}
+
 func TestTypeString(t *testing.T) {
 	testCases := []struct {
 		name       string

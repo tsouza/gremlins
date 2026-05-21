@@ -42,6 +42,28 @@ const (
 	TimedOut
 )
 
+// ParseShutdownStatus maps the CLI/config value for "what status to assign
+// to mutants that were still in-flight when the runner cancelled the run"
+// to a concrete Status. The returned bool is false for unrecognised inputs.
+//
+// Accepted forms (case-insensitive): "not-run" (alias "notrun"),
+// "timed-out" (aliases "timedout", "timeout"), "lived".
+//
+// "not-run" maps to NotCovered — the closest existing semantic for "we
+// never got a chance to run this mutant", and avoids inventing a new
+// Status value that would break downstream JSON consumers.
+func ParseShutdownStatus(s string) (Status, bool) {
+	switch s {
+	case "not-run", "notrun", "":
+		return NotCovered, true
+	case "timed-out", "timedout", "timeout":
+		return TimedOut, true
+	case "lived":
+		return Lived, true
+	}
+	return 0, false
+}
+
 func (ms Status) String() string {
 	switch ms {
 	case NotCovered:
