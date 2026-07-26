@@ -440,6 +440,34 @@ coefficient. For example:
 gremlins unleash --timeout-coefficient=10
 ```
 
+### Timeout max
+
+:material-flag: `--timeout-max` · :material-sign-direction:
+Default: `""` (no ceiling)
+
+An absolute ceiling on a single mutant's test run, as a Go duration. It caps
+the coefficient-derived timeout; it never raises it.
+
+The coefficient scales the timeout by how long the package's own tests take,
+which is unrelated to how much damage a mutant can do in that time. A mutant
+that inverts a loop-advance statement (`i++` → `i--`) inside a scanning loop
+that appends on every iteration never terminates and allocates until the
+machine runs out of memory. On a CI runner the OOM killer then reaps the
+runner agent itself and the job dies with no verdict at all. Because the
+coefficient hands the longest timeouts to the slowest-testing packages, those
+packages are the most exposed — which is backwards.
+
+This flag bounds that exposure independently of the baseline. Past the
+ceiling the mutant is killed and recorded as `TIMED OUT`, the honest verdict
+for a mutant that did not terminate.
+
+```shell
+gremlins unleash --timeout-max=15s
+```
+
+A malformed or non-positive value is reported on stderr and ignored, leaving
+the run with no ceiling.
+
 [//]: # (@formatter:off)
 !!! note "Result Consistency"
     You may observe small fluctuations in the number of
