@@ -38,6 +38,11 @@ import (
 // of each test run.
 const DefaultTimeoutCoefficient = 5
 
+// noTimeoutMax is the timeout ceiling meaning "no ceiling": the per-mutant
+// timeout is whatever the coefficient produces. This is the default, so the
+// behaviour of a run that does not set --timeout-max is unchanged.
+const noTimeoutMax = time.Duration(0)
+
 // ExecutorDealer is the initializer for new workerpool.Executor.
 type ExecutorDealer interface {
 	NewExecutor(mut mutator.Mutator, outCh chan<- mutator.Mutator, wg *sync.WaitGroup) workerpool.Executor
@@ -114,7 +119,7 @@ func NewExecutorDealer(mod gomodule.GoModule, wdd workdir.Dealer, elapsed time.D
 		dryRun:            dryRun,
 		integrationMode:   integrationMode,
 		testCPU:           testCPU,
-		testExecutionTime: baseTime * time.Duration(coefficient),
+		testExecutionTime: cappedExecutionTime(baseTime * time.Duration(coefficient)),
 		execContext:       exec.CommandContext,
 	}
 
@@ -123,6 +128,54 @@ func NewExecutorDealer(mod gomodule.GoModule, wdd workdir.Dealer, elapsed time.D
 	}
 
 	return &jd
+}
+
+// cappedExecutionTime clamps a coefficient-derived per-mutant timeout to the
+// absolute ceiling set by --timeout-max, if one is set.
+//
+// The coefficient-derived timeout is proportional to how long the package's own
+// tests take, which is unrelated to how much damage a runaway mutant can do in
+// that time. Mutating a loop-advance statement (i++ -> i--) inside a scanner
+// loop whose body appends per iteration produces a mutant that never terminates
+// and allocates until the machine is out of memory. On a CI runner the OOM
+// killer then reaps the runner agent itself, so the job dies with no verdict at
+// all — not a LIVED mutant, not a TIMED OUT one, just a dead runner. The
+// timeout is the only defence against that, and scaling it by test duration
+// hands the longest leash to the slowest-testing packages, which is backwards.
+//
+// A ceiling bounds the exposure independently of the baseline: past it the
+// mutant is killed and recorded as TIMED OUT, which is the honest verdict for a
+// mutant that did not terminate.
+//
+// Zero (the default) means no ceiling, so runs that do not set the flag behave
+// exactly as before. A malformed or non-positive value is reported and ignored
+// rather than silently treated as "no cap", because a safety ceiling that
+// quietly does nothing is worse than one that was never configured.
+func cappedExecutionTime(d time.Duration) time.Duration {
+	raw := configuration.Get[string](configuration.UnleashTimeoutMaxKey)
+	if raw == "" {
+		return d
+	}
+
+	max, err := time.ParseDuration(raw)
+	if err != nil {
+		log.Errorf("invalid %s %q: %v; running without a timeout ceiling\n",
+			configuration.UnleashTimeoutMaxKey, raw, err)
+
+		return d
+	}
+	if max <= noTimeoutMax {
+		log.Errorf("invalid %s %q: must be positive; running without a timeout ceiling\n",
+			configuration.UnleashTimeoutMaxKey, raw)
+
+		return d
+	}
+
+	if d > max {
+		return max
+	}
+
+	return d
 }
 
 // NewExecutor returns a new workerpool.Executor for the given mutator.Mutator.

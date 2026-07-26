@@ -42,6 +42,7 @@ const (
 	UnleashWorkersKey            = "unleash.workers"
 	UnleashTestCPUKey            = "unleash.test-cpu"
 	UnleashTimeoutCoefficientKey = "unleash.timeout-coefficient"
+	UnleashTimeoutMaxKey         = "unleash.timeout-max"
 	UnleashIntegrationMode       = "unleash.integration"
 	UnleashExcludeFiles          = "unleash.exclude-files"
 	UnleashDiffRef               = "unleash.diff"
