@@ -70,14 +70,6 @@ const testTimeoutMarker = "panic: test timed out after "
 // indefinitely, which is the one hang the two time bounds below cannot catch.
 const outputDrainGrace = 2 * time.Second
 
-// buildFailureMarker and setupFailureMarker are what `go test` appends to the
-// FAIL line for a package whose test binary could not be built, or whose test
-// setup failed before any test ran. Both mean the mutant was never adjudicated.
-const (
-	buildFailureMarker = " [build failed]"
-	setupFailureMarker = " [setup failed]"
-)
-
 // ExecutorDealer is the initializer for new workerpool.Executor.
 type ExecutorDealer interface {
 	NewExecutor(mut mutator.Mutator, outCh chan<- mutator.Mutator, wg *sync.WaitGroup) workerpool.Executor
@@ -352,8 +344,15 @@ func (m *mutantExecutor) Start(w *workerpool.Worker) {
 // timeout, a build failure and an ordinary test failure all as exit status 1 —
 // only the test BINARY exits 2, and what we spawn is `go`. Taking that 1 at face
 // value would record a timed-out mutant as KILLED, crediting a detection that
-// never happened, and a mutant that does not compile as KILLED too. So the
-// child's output is scanned for the markers that tell the three apart.
+// never happened. So the child's output is scanned for the marker the test
+// binary prints when its own -timeout fires.
+//
+// A build failure is the third case sharing that exit status, and it is still
+// recorded as KILLED here. Separating it needs the mutators fixed as well as the
+// verdict — gremlins currently mutates the unary address-of `&` as if it were
+// bitwise AND, so `&Foo{}` becomes `|Foo{}` and a large share of a package's
+// mutants cannot compile at all. Classifying without removing them only moves
+// noise from one column to another. Tracked in cerberus issue #2930.
 func (m *mutantExecutor) runTests(rootDir, pkg string) mutator.Status {
 	ctx, cancel := context.WithTimeout(m.runCtx, m.testExecutionTime+m.compileAllowance)
 	defer cancel()
@@ -391,18 +390,11 @@ func (m *mutantExecutor) runTests(rootDir, pkg string) mutator.Status {
 	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
-		// The timeout marker is checked first. A mutant that does not compile
-		// never runs a test binary, so it cannot print the timeout panic, and
-		// the orders only differ for a multi-package run where one package
-		// failed to build and another timed out. TIMED OUT is the safe verdict
-		// there: it stays in the efficacy denominator and credits nobody,
-		// whereas NOT VIABLE would drop the mutant out of the denominator
-		// altogether.
+		// TIMED OUT rather than the exit status: it stays in the efficacy
+		// denominator and credits nobody, whereas KILLED would pay the suite
+		// for a detection that never happened.
 		if scanner.sawTestTimeout() {
 			return mutator.TimedOut
-		}
-		if scanner.sawBuildFailure() {
-			return mutator.NotViable
 		}
 
 		return getTestFailedStatus(exitErr.ExitCode())
@@ -423,7 +415,7 @@ type outputScanner struct {
 }
 
 // scannedMarkers are the substrings outputScanner looks for.
-var scannedMarkers = []string{testTimeoutMarker, buildFailureMarker, setupFailureMarker}
+var scannedMarkers = []string{testTimeoutMarker}
 
 func newOutputScanner() *outputScanner {
 	carry := 0
@@ -467,12 +459,6 @@ func (s *outputScanner) saw(marker string) bool {
 // sawTestTimeout reports whether the test binary aborted on its own -timeout.
 func (s *outputScanner) sawTestTimeout() bool {
 	return s.saw(testTimeoutMarker)
-}
-
-// sawBuildFailure reports whether the package failed to build, or failed to set
-// up before any test ran. Either way the mutant was never adjudicated.
-func (s *outputScanner) sawBuildFailure() bool {
-	return s.saw(buildFailureMarker) || s.saw(setupFailureMarker)
 }
 
 // shutdownStatus returns the status to record for mutants that were
@@ -550,12 +536,12 @@ func run(ctx context.Context, cmd *exec.Cmd) error {
 	}
 }
 
-// getTestFailedStatus maps a non-zero exit status to a verdict. It is reached
-// only after runTests has ruled out the two statuses that `go test` also folds
-// into exit 1 — a test timeout and a build failure — so a 1 here really is a
-// failing test, which is a detection. Status 2 is what a test BINARY returns
-// when it panics; `go test` does not surface it, but a direct binary invocation
-// would, and it means the mutant was never adjudicated.
+// getTestFailedStatus maps a non-zero exit status to a verdict. runTests has
+// already taken the test timeouts out of exit 1 before reaching here; a build
+// failure still arrives as 1 and is still booked KILLED (cerberus issue #2930).
+// Status 2 is what a test BINARY returns when it panics; `go test` does not
+// surface it, but a direct binary invocation would, and it means the mutant was
+// never adjudicated.
 func getTestFailedStatus(exitCode int) mutator.Status {
 	switch exitCode {
 	case 1:
