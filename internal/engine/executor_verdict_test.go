@@ -19,6 +19,7 @@ package engine_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -67,6 +68,13 @@ type goTestFixture struct {
 	// unambiguously slow. Without it the toolchain answers from cache and the
 	// compile phase is too fast to say anything about.
 	coldCache bool
+	// supervisor, when non-empty, is the body of a `go test -exec` shell script
+	// interposed in front of the test binary. It models the external memory
+	// supervisor cerberus wires in (.github/scripts/mutant-memory-guard.mjs),
+	// which kills a mutant that breaches a resident-memory ceiling and then
+	// HOLDS rather than exiting, so that no exit status of its own can be read
+	// as a verdict.
+	supervisor string
 }
 
 // runMutant applies the fixture and returns the verdict the executor reached,
@@ -82,6 +90,19 @@ func runMutant(t *testing.T, fx goTestFixture) (mutator.Status, time.Duration) {
 
 	if fx.coldCache {
 		t.Setenv("GOCACHE", t.TempDir())
+	}
+
+	if fx.supervisor != "" {
+		// -exec is reached through GOFLAGS because the executor builds the
+		// `go test` argv itself, which is exactly how cerberus wires its guard
+		// in. GOFLAGS is space-separated with no quoting, so the path may not
+		// contain whitespace.
+		guard := filepath.Join(t.TempDir(), "supervisor.sh")
+		writeExecutable(t, guard, fx.supervisor)
+		if strings.ContainsAny(guard, " \t") {
+			t.Fatalf("the supervisor path contains whitespace, which GOFLAGS cannot express: %s", guard)
+		}
+		t.Setenv("GOFLAGS", "-exec="+guard)
 	}
 
 	settings := map[string]any{
@@ -116,6 +137,16 @@ func runMutant(t *testing.T, fx goTestFixture) (mutator.Status, time.Duration) {
 		t.Fatal("executor never wrote a verdict")
 
 		return mutator.NotCovered, elapsed
+	}
+}
+
+// writeExecutable writes a shell script and marks it runnable. Separate from
+// writeFile because the mode is the whole point.
+func writeExecutable(t *testing.T, path, content string) {
+	t.Helper()
+
+	if err := os.WriteFile(path, []byte(content), 0o700); err != nil {
+		t.Fatalf("writing %s: %v", path, err)
 	}
 }
 
@@ -228,17 +259,19 @@ func TestVerdictsFromRealGoTest(t *testing.T) {
 			want: mutator.NotViable,
 		},
 		{
-			// The run-only leash firing. TIMED OUT stays in the efficacy
-			// denominator and credits nobody; KILLED would credit a detection
-			// that never happened, and NOT VIABLE would drop the mutant out of
-			// the denominator altogether.
-			name: "a test that does not terminate is TIMED OUT",
+			// The run-only leash firing, reported by the test binary itself.
+			// RUN TIMED OUT is the one verdict here backed by a positive
+			// observation about the mutant rather than by a deadline expiring
+			// around it, which is why it is a status of its own: a consumer that
+			// cannot tell it from the compile backstop cannot tell a
+			// non-terminating mutant from a slow compiler.
+			name: "a test that does not terminate is RUN TIMED OUT",
 			fx: goTestFixture{
 				sources:          map[string]string{"verdict.go": baseSource, "verdict_test.go": nonTerminatingTest},
 				runBound:         "1s",
 				compileAllowance: generousCompileAllowance,
 			},
-			want: mutator.TimedOut,
+			want: mutator.RunTimedOut,
 		},
 	}
 
@@ -293,8 +326,70 @@ func TestCompileIsNotChargedToTheRunBound(t *testing.T) {
 			coldCache:        true,
 		})
 
+		// TIMED OUT, emphatically not RUN TIMED OUT: no test binary existed,
+		// so nothing observed the mutant at all. Collapsing the two here is how
+		// a hung compile would get paid as a detection.
 		if got != mutator.TimedOut {
 			t.Errorf("expected TIMED OUT from the compile backstop, got %v", got)
+		}
+	})
+}
+
+// reapingSupervisor models .github/scripts/mutant-memory-guard.mjs in cerberus:
+// it starts the test binary, kills it as a resident-memory breach would, and
+// then HOLDS without ever exiting. Holding is the guard's whole design — every
+// exit status it could produce is one `go test` collapses into its own exit 1,
+// which would be read as a KILL — so the mutant has to be claimed by a deadline
+// instead. The reapWait gives the binary time to be running before it is killed,
+// and the hold is long enough that only the backstop can end this mutant.
+const reapingSupervisor = `#!/bin/sh
+"$@" &
+child=$!
+sleep 1
+kill -9 "$child" 2>/dev/null
+wait "$child" 2>/dev/null
+sleep 3600
+`
+
+// TestAReapedMutantIsNotCreditedAsARunTimeout is the boundary that makes
+// crediting a run-phase timeout safe (cerberus #2921, #2944).
+//
+// An external supervisor that kills a mutant for breaching a memory ceiling
+// destroys the very evidence RUN TIMED OUT is made of: no test binary survives
+// to print its own timeout panic. The mutant is therefore claimed by the
+// compile+run backstop, exactly like a hung compile, and stays unadjudicated.
+//
+// The two halves share one fixture and differ only in whether the supervisor is
+// interposed, so the contrast is the mechanism itself rather than two unrelated
+// scenarios. Without the supervisor the run watchdog fires and the verdict is
+// RUN TIMED OUT; with it, the same mutant is TIMED OUT.
+func TestAReapedMutantIsNotCreditedAsARunTimeout(t *testing.T) {
+	fixture := func(supervisor string) goTestFixture {
+		return goTestFixture{
+			sources:          map[string]string{"verdict.go": baseSource, "verdict_test.go": nonTerminatingTest},
+			runBound:         "3s",
+			compileAllowance: "2s",
+			supervisor:       supervisor,
+		}
+	}
+
+	t.Run("unsupervised, the run watchdog claims it", func(t *testing.T) {
+		got, _ := runMutant(t, fixture(""))
+		if got != mutator.RunTimedOut {
+			t.Fatalf("expected RUN TIMED OUT from the run watchdog, got %v — without this half the case"+
+				" below proves nothing, because it could not tell a reaped mutant from an unreachable one", got)
+		}
+	})
+
+	t.Run("reaped before the watchdog, the backstop claims it", func(t *testing.T) {
+		got, _ := runMutant(t, fixture(reapingSupervisor))
+		if got == mutator.RunTimedOut {
+			t.Fatalf("a mutant killed by an external memory supervisor was credited as a run-phase" +
+				" timeout: no test binary lived long enough to report anything, so this is the compile" +
+				" backstop wearing a detection's name")
+		}
+		if got != mutator.TimedOut {
+			t.Fatalf("expected TIMED OUT for a reaped mutant, got %v", got)
 		}
 	})
 }

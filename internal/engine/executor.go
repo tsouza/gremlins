@@ -354,6 +354,16 @@ func (m *mutantExecutor) Start(w *workerpool.Worker) {
 // value would record a timed-out mutant as KILLED, crediting a detection that
 // never happened, and a mutant that does not compile as KILLED too. So the
 // child's output is scanned for the markers that tell the three apart.
+//
+// The two bounds also produce two DIFFERENT timeout verdicts, and the ordering
+// below is what keeps them apart. mutator.RunTimedOut is the only branch here
+// backed by a positive observation: the test binary printed, in its own output,
+// that the suite it was running overran the leash `go test -timeout` gave it.
+// Every other branch infers from an absence — a deadline that expired, a context
+// that was cancelled, an exit status that says nothing about which phase
+// produced it. mutator.TimedOut is that absence, and it must stay separate
+// precisely because a compile that hung reaches it identically to a run that
+// did.
 func (m *mutantExecutor) runTests(rootDir, pkg string) mutator.Status {
 	ctx, cancel := context.WithTimeout(m.runCtx, m.testExecutionTime+m.compileAllowance)
 	defer cancel()
@@ -378,6 +388,27 @@ func (m *mutantExecutor) runTests(rootDir, pkg string) mutator.Status {
 
 	err := run(ctx, cmd)
 
+	// The run-phase watchdog is read before either deadline, because it is
+	// evidence and they are the lack of it. Two things follow from that order.
+	//
+	// A goroutine dump from a runaway mutant can be large, and the backstop can
+	// expire while it is still draining; reading the backstop first would relabel
+	// the one mutant that DID report a verdict as one that did not. And a mutant
+	// that printed the marker before the runner's SIGTERM arrived was adjudicated
+	// by its own test binary before the shutdown, so the shutdown status would
+	// discard a verdict already reached.
+	//
+	// `err != nil` guards the marker: a package whose tests all pass exits 0, and
+	// a test that merely PRINTS this string while passing must not be read as one
+	// that overran. A binary the watchdog actually fired on always exits non-zero,
+	// and a deadline-killed child returns the context's error, so no real timeout
+	// is lost to the guard.
+	if err != nil && scanner.sawTestTimeout() {
+		return mutator.RunTimedOut
+	}
+	// The backstop bounds compile AND run together, so when it is what fired we
+	// do not know which phase spent it. Unadjudicated: it stays in the efficacy
+	// denominator and credits nobody.
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return mutator.TimedOut
 	}
@@ -391,16 +422,12 @@ func (m *mutantExecutor) runTests(rootDir, pkg string) mutator.Status {
 	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
-		// The timeout marker is checked first. A mutant that does not compile
-		// never runs a test binary, so it cannot print the timeout panic, and
-		// the orders only differ for a multi-package run where one package
-		// failed to build and another timed out. TIMED OUT is the safe verdict
-		// there: it stays in the efficacy denominator and credits nobody,
-		// whereas NOT VIABLE would drop the mutant out of the denominator
-		// altogether.
-		if scanner.sawTestTimeout() {
-			return mutator.TimedOut
-		}
+		// A mutant that does not compile never runs a test binary, so it cannot
+		// print the timeout panic and cannot have been claimed by the branch
+		// above; the two markers only compete for a multi-package run where one
+		// package failed to build and another timed out. RUN TIMED OUT is the
+		// safe verdict there, because NOT VIABLE would drop the mutant out of
+		// the denominator altogether.
 		if scanner.sawBuildFailure() {
 			return mutator.NotViable
 		}
