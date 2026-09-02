@@ -235,6 +235,7 @@ func TestMutatorRun(t *testing.T) {
 		tags               string
 		wantPath           string
 		timeoutMax         string
+		compileAllowance   string
 		timeoutCoefficient int
 		// wantExecutionTime, when non-zero, is the per-mutant timeout the run
 		// must end up with, overriding the coefficient-derived expectation.
@@ -312,6 +313,32 @@ func TestMutatorRun(t *testing.T) {
 			tags:              "tag1,t1g2",
 			wantPath:          "example.com/my/package",
 		},
+		{
+			// The compile allowance moves the context deadline and must leave
+			// the run bound alone: it buys time for compiling, not for running.
+			name:             "compile-allowance extends the deadline but not the run bound",
+			compileAllowance: "3m",
+			pkg:              "example.com/my/package",
+			callDir:          "test/dir",
+			tags:             "tag1,t1g2",
+			wantPath:         "example.com/my/package",
+		},
+		{
+			name:             "a malformed compile-allowance falls back to the default",
+			compileAllowance: "three minutes",
+			pkg:              "example.com/my/package",
+			callDir:          "test/dir",
+			tags:             "tag1,t1g2",
+			wantPath:         "example.com/my/package",
+		},
+		{
+			name:             "a non-positive compile-allowance falls back to the default",
+			compileAllowance: "0s",
+			pkg:              "example.com/my/package",
+			callDir:          "test/dir",
+			tags:             "tag1,t1g2",
+			wantPath:         "example.com/my/package",
+		},
 	}
 	for _, tc := range testCases {
 		tc := tc
@@ -325,6 +352,9 @@ func TestMutatorRun(t *testing.T) {
 			}
 			if tc.timeoutMax != "" {
 				settings[configuration.UnleashTimeoutMaxKey] = tc.timeoutMax
+			}
+			if tc.compileAllowance != "" {
+				settings[configuration.UnleashCompileAllowanceKey] = tc.compileAllowance
 			}
 			viperSet(settings)
 			defer viperReset()
@@ -358,24 +388,40 @@ func TestMutatorRun(t *testing.T) {
 			executor.Start(w)
 			wg.Wait()
 
-			wantTimeout := 2*time.Second + expectedTimeout*engine.DefaultTimeoutCoefficient
+			// -timeout carries the run bound verbatim. Nothing is added to it:
+			// the whole point is that the leash Go enforces on the test RUN is
+			// the tighter of the two bounds, so a slow compile cannot eat it.
+			wantRunBound := expectedTimeout * engine.DefaultTimeoutCoefficient
 			if tc.timeoutCoefficient != 0 {
-				wantTimeout = 2*time.Second + expectedTimeout*time.Duration(tc.timeoutCoefficient)
+				wantRunBound = expectedTimeout * time.Duration(tc.timeoutCoefficient)
 			}
 			if tc.wantExecutionTime != 0 {
-				wantTimeout = 2*time.Second + tc.wantExecutionTime
+				wantRunBound = tc.wantExecutionTime
 			}
-			want := fmt.Sprintf("go test -tags %s -timeout %s -failfast %s", tc.tags, wantTimeout, tc.wantPath)
+			want := fmt.Sprintf("go test -tags %s -timeout %s -failfast %s", tc.tags, wantRunBound, tc.wantPath)
 			got := fmt.Sprintf("go %v", strings.Join(holder.args, " "))
 
 			if !cmp.Equal(got, want) {
 				t.Errorf("\n+ %s\n- %s\n", got, want)
 			}
 
-			timeoutDifference := absTimeDiff(holder.timeout, expectedTimeout*2)
-			diffThreshold := 100 * time.Second
-			if timeoutDifference > diffThreshold {
-				t.Errorf("expected timeout to be within %s from the set timeout, got %s", diffThreshold, timeoutDifference)
+			// The context deadline is the backstop: the run bound PLUS the
+			// compile allowance, so compilation is charged to it and not to the
+			// run bound above.
+			wantAllowance := engine.DefaultCompileAllowance
+			if tc.compileAllowance != "" {
+				parsed, err := time.ParseDuration(tc.compileAllowance)
+				if err == nil && parsed > 0 {
+					wantAllowance = parsed
+				}
+			}
+			wantDeadline := wantRunBound + wantAllowance
+			// The deadline is read after the context is created, so a little of
+			// it has already elapsed; only scheduling slack is tolerated.
+			const deadlineSlack = 2 * time.Second
+			if d := absTimeDiff(holder.timeout, wantDeadline); d > deadlineSlack {
+				t.Errorf("expected the context deadline to be %s (run bound %s + compile allowance %s), got %s",
+					wantDeadline, wantRunBound, wantAllowance, holder.timeout)
 			}
 		})
 	}
