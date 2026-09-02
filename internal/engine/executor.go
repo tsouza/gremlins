@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -38,10 +39,44 @@ import (
 // of each test run.
 const DefaultTimeoutCoefficient = 5
 
-// noTimeoutMax is the timeout ceiling meaning "no ceiling": the per-mutant
-// timeout is whatever the coefficient produces. This is the default, so the
-// behaviour of a run that does not set --timeout-max is unchanged.
-const noTimeoutMax = time.Duration(0)
+// unsetDuration is the zero a duration setting reads as when it is absent or
+// rejected. Every reader of it applies its own fallback rather than using it as
+// a bound: a zero bound would kill every mutant instantly and report the
+// package as perfectly tested.
+const unsetDuration = time.Duration(0)
+
+// DefaultCompileAllowance is how long a mutant is allowed to COMPILE, over and
+// above the timeout that bounds its test run.
+//
+// The two bounds measure unrelated things. A package's compile time is a
+// property of its size and its dependency graph; a mutant's run time is a
+// property of the test that adjudicates it. Charging both to one number makes
+// the slow-compiling packages time out mutants that would have reached a
+// verdict in milliseconds. Two minutes is roughly four times the slowest
+// single-package compile observed on the projects this fork is used against
+// (~31s), which is headroom enough to be invisible in practice while still
+// bounding a compile that has genuinely hung.
+const DefaultCompileAllowance = 2 * time.Minute
+
+// testTimeoutMarker is the first thing the testing package prints when the
+// -timeout it was given expires. `go test` collapses a test timeout, a build
+// failure and an ordinary test failure into its own exit status 1, so the exit
+// code alone cannot tell them apart and the output has to.
+const testTimeoutMarker = "panic: test timed out after "
+
+// outputDrainGrace bounds how long Wait may block draining the child's output
+// pipes after the child itself has exited. Without it a grandchild that
+// inherited the pipe and outlived its parent would hold the executor open
+// indefinitely, which is the one hang the two time bounds below cannot catch.
+const outputDrainGrace = 2 * time.Second
+
+// buildFailureMarker and setupFailureMarker are what `go test` appends to the
+// FAIL line for a package whose test binary could not be built, or whose test
+// setup failed before any test ran. Both mean the mutant was never adjudicated.
+const (
+	buildFailureMarker = " [build failed]"
+	setupFailureMarker = " [setup failed]"
+)
 
 // ExecutorDealer is the initializer for new workerpool.Executor.
 type ExecutorDealer interface {
@@ -63,6 +98,7 @@ type MutantExecutorDealer struct {
 	mod               gomodule.GoModule
 	buildTags         string
 	testExecutionTime time.Duration
+	compileAllowance  time.Duration
 	dryRun            bool
 	integrationMode   bool
 	testCPU           int
@@ -120,6 +156,7 @@ func NewExecutorDealer(mod gomodule.GoModule, wdd workdir.Dealer, elapsed time.D
 		integrationMode:   integrationMode,
 		testCPU:           testCPU,
 		testExecutionTime: cappedExecutionTime(baseTime * time.Duration(coefficient)),
+		compileAllowance:  compileAllowance(),
 		execContext:       exec.CommandContext,
 	}
 
@@ -130,8 +167,8 @@ func NewExecutorDealer(mod gomodule.GoModule, wdd workdir.Dealer, elapsed time.D
 	return &jd
 }
 
-// cappedExecutionTime clamps a coefficient-derived per-mutant timeout to the
-// absolute ceiling set by --timeout-max, if one is set.
+// cappedExecutionTime clamps the coefficient-derived bound on a mutant's test
+// RUN to the absolute ceiling set by --timeout-max, if one is set.
 //
 // The coefficient-derived timeout is proportional to how long the package's own
 // tests take, which is unrelated to how much damage a runaway mutant can do in
@@ -152,22 +189,8 @@ func NewExecutorDealer(mod gomodule.GoModule, wdd workdir.Dealer, elapsed time.D
 // rather than silently treated as "no cap", because a safety ceiling that
 // quietly does nothing is worse than one that was never configured.
 func cappedExecutionTime(d time.Duration) time.Duration {
-	raw := configuration.Get[string](configuration.UnleashTimeoutMaxKey)
-	if raw == "" {
-		return d
-	}
-
-	max, err := time.ParseDuration(raw)
-	if err != nil {
-		log.Errorf("invalid %s %q: %v; running without a timeout ceiling\n",
-			configuration.UnleashTimeoutMaxKey, raw, err)
-
-		return d
-	}
-	if max <= noTimeoutMax {
-		log.Errorf("invalid %s %q: must be positive; running without a timeout ceiling\n",
-			configuration.UnleashTimeoutMaxKey, raw)
-
+	max, ok := positiveDuration(configuration.UnleashTimeoutMaxKey, "running without a timeout ceiling")
+	if !ok {
 		return d
 	}
 
@@ -176,6 +199,47 @@ func cappedExecutionTime(d time.Duration) time.Duration {
 	}
 
 	return d
+}
+
+// compileAllowance returns the time a mutant is allowed to compile, on top of
+// the bound on its test run. It is configured with --compile-allowance and
+// falls back to DefaultCompileAllowance.
+func compileAllowance() time.Duration {
+	d, ok := positiveDuration(configuration.UnleashCompileAllowanceKey, "using the default compile allowance")
+	if !ok {
+		return DefaultCompileAllowance
+	}
+
+	return d
+}
+
+// positiveDuration reads a Go duration from a string configuration key. It
+// reports ok=false when the key is unset, unparseable, or non-positive, so the
+// caller applies its own fallback.
+//
+// A malformed value is reported and ignored rather than silently treated as
+// zero: a zero bound would kill every mutant instantly and report the package
+// as perfectly tested. onInvalid names what the caller will do instead, so the
+// message says what actually happens rather than only what did not.
+func positiveDuration(key, onInvalid string) (time.Duration, bool) {
+	raw := configuration.Get[string](key)
+	if raw == "" {
+		return unsetDuration, false
+	}
+
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		log.Errorf("invalid %s %q: %v; %s\n", key, raw, err, onInvalid)
+
+		return unsetDuration, false
+	}
+	if d <= unsetDuration {
+		log.Errorf("invalid %s %q: must be positive; %s\n", key, raw, onInvalid)
+
+		return unsetDuration, false
+	}
+
+	return d, true
 }
 
 // NewExecutor returns a new workerpool.Executor for the given mutator.Mutator.
@@ -199,6 +263,7 @@ func (m MutantExecutorDealer) NewExecutor(mut mutator.Mutator, outCh chan<- muta
 		execContext:       m.execContext,
 		testCPU:           m.testCPU,
 		testExecutionTime: m.testExecutionTime,
+		compileAllowance:  m.compileAllowance,
 		runCtx:            runCtx,
 	}
 
@@ -217,6 +282,7 @@ type mutantExecutor struct {
 	module            gomodule.GoModule
 	buildTags         string
 	testExecutionTime time.Duration
+	compileAllowance  time.Duration
 	dryRun            bool
 	integrationMode   bool
 	testCPU           int
@@ -229,9 +295,9 @@ type mutantExecutor struct {
 // run the tests and mark the TokenMutator as either KILLED or LIVED depending
 // on the result. If the tests pass, it means the TokenMutator survived, so it
 // will be LIVED, if the tests fail, the TokenMutator will be KILLED.
-// The timeout of the test is managed outside the run of the test, using
-// a context with timeout. This is done because the Go test command doesn't
-// make it easy to distinguish failures from timeouts.
+// A mutant is bounded twice: `go test -timeout` bounds the test RUN, and a
+// context deadline bounds compilation and the run together as a backstop. See
+// runTests for why the two are separate.
 func (m *mutantExecutor) Start(w *workerpool.Worker) {
 	defer m.wg.Done()
 	workerName := fmt.Sprintf("%s-%d", w.Name, w.ID)
@@ -266,12 +332,30 @@ func (m *mutantExecutor) Start(w *workerpool.Worker) {
 	m.outCh <- m.mutant
 }
 
+// runTests runs the mutated package's tests and classifies the outcome.
+//
+// Two bounds, because there are two things to bound and they scale
+// independently:
+//
+//   - `go test -timeout` (m.testExecutionTime) bounds the test RUN. The Go
+//     toolchain starts that clock when the test binary starts, so compiling the
+//     mutated package does not consume it. This is the leash that matters: it is
+//     what stops a mutant that never terminates.
+//   - The context deadline (run bound + compile allowance) bounds compilation
+//     and the run together. No -timeout can bound a compile that hangs, because
+//     no test binary exists yet to enforce it, so the context stays as the
+//     backstop. It is also rooted in the engine's runCtx, so an external
+//     cancellation (e.g. SIGTERM from a CI runner) propagates into the child and
+//     we can tell "the runner is shutting us down" from "this mutant ran long".
+//
+// Classification cannot go on the exit status alone. `go test` reports a test
+// timeout, a build failure and an ordinary test failure all as exit status 1 —
+// only the test BINARY exits 2, and what we spawn is `go`. Taking that 1 at face
+// value would record a timed-out mutant as KILLED, crediting a detection that
+// never happened, and a mutant that does not compile as KILLED too. So the
+// child's output is scanned for the markers that tell the three apart.
 func (m *mutantExecutor) runTests(rootDir, pkg string) mutator.Status {
-	// Root the test ctx in the engine's runCtx so that an external
-	// cancellation (e.g. SIGTERM from a CI runner) propagates into the
-	// `go test` subprocess and we can distinguish "the runner is shutting
-	// us down" from "the test ran past its deadline".
-	ctx, cancel := context.WithTimeout(m.runCtx, m.testExecutionTime)
+	ctx, cancel := context.WithTimeout(m.runCtx, m.testExecutionTime+m.compileAllowance)
 	defer cancel()
 
 	cmd := m.execContext(ctx, "go", m.getTestArgs(pkg)...)
@@ -281,6 +365,13 @@ func (m *mutantExecutor) runTests(rootDir, pkg string) mutator.Status {
 	}
 	cmd.Env = append(cmd.Env, os.Environ()...)
 	cmd.Env = append(cmd.Env, fmt.Sprintf("GOTMPDIR=%s", m.wdDealer.WorkDir()))
+
+	// The output is scanned, never retained: a runaway mutant can print without
+	// bound, and buffering that would trade one resource exhaustion for another.
+	scanner := newOutputScanner()
+	cmd.Stdout = scanner
+	cmd.Stderr = scanner
+	cmd.WaitDelay = outputDrainGrace
 
 	// Set up process group for killing entire process tree
 	setupProcessGroup(cmd)
@@ -300,10 +391,88 @@ func (m *mutantExecutor) runTests(rootDir, pkg string) mutator.Status {
 	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
+		// The timeout marker is checked first. A mutant that does not compile
+		// never runs a test binary, so it cannot print the timeout panic, and
+		// the orders only differ for a multi-package run where one package
+		// failed to build and another timed out. TIMED OUT is the safe verdict
+		// there: it stays in the efficacy denominator and credits nobody,
+		// whereas NOT VIABLE would drop the mutant out of the denominator
+		// altogether.
+		if scanner.sawTestTimeout() {
+			return mutator.TimedOut
+		}
+		if scanner.sawBuildFailure() {
+			return mutator.NotViable
+		}
+
 		return getTestFailedStatus(exitErr.ExitCode())
 	}
 
 	return mutator.Lived
+}
+
+// outputScanner is an io.Writer that watches a stream for fixed markers and
+// then throws it away. It retains only enough bytes to recognise a marker split
+// across two writes, so its memory use is constant however much the child
+// prints.
+type outputScanner struct {
+	mu    sync.Mutex
+	tail  string
+	seen  map[string]bool
+	carry int
+}
+
+// scannedMarkers are the substrings outputScanner looks for.
+var scannedMarkers = []string{testTimeoutMarker, buildFailureMarker, setupFailureMarker}
+
+func newOutputScanner() *outputScanner {
+	carry := 0
+	for _, marker := range scannedMarkers {
+		if len(marker) > carry {
+			carry = len(marker)
+		}
+	}
+
+	return &outputScanner{seen: make(map[string]bool, len(scannedMarkers)), carry: carry - 1}
+}
+
+func (s *outputScanner) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	window := s.tail + string(p)
+	for _, marker := range scannedMarkers {
+		if strings.Contains(window, marker) {
+			s.seen[marker] = true
+		}
+	}
+
+	// Retain just enough of the tail that a marker straddling two writes is
+	// still recognised on the next one.
+	if len(window) > s.carry {
+		window = window[len(window)-s.carry:]
+	}
+	s.tail = window
+
+	return len(p), nil
+}
+
+func (s *outputScanner) saw(marker string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.seen[marker]
+}
+
+// sawTestTimeout reports whether the test binary aborted on its own -timeout.
+func (s *outputScanner) sawTestTimeout() bool {
+	return s.saw(testTimeoutMarker)
+}
+
+// sawBuildFailure reports whether the package failed to build, or failed to set
+// up before any test ran. Either way the mutant was never adjudicated.
+func (s *outputScanner) sawBuildFailure() bool {
+	return s.saw(buildFailureMarker) || s.saw(setupFailureMarker)
 }
 
 // shutdownStatus returns the status to record for mutants that were
@@ -324,10 +493,11 @@ func (m *mutantExecutor) getTestArgs(pkg string) []string {
 	if m.buildTags != "" {
 		args = append(args, "-tags", m.buildTags)
 	}
-	// Here we add some seconds to the timeout to be sure it's gremlins that catches the test
-	// timeout and not the test itself. The timeout on the test prevents the test.* processes
-	// from hanging forever.
-	args = append(args, "-timeout", (2*time.Second + m.testExecutionTime).String())
+	// -timeout is the run-only leash, and it is deliberately the tighter of the
+	// two bounds: the Go toolchain starts it when the test binary starts, so a
+	// slow compile cannot eat it. The context deadline in runTests sits above it
+	// and covers compilation as well.
+	args = append(args, "-timeout", m.testExecutionTime.String())
 	args = append(args, "-failfast")
 
 	if m.testCPU != 0 {
@@ -380,6 +550,12 @@ func run(ctx context.Context, cmd *exec.Cmd) error {
 	}
 }
 
+// getTestFailedStatus maps a non-zero exit status to a verdict. It is reached
+// only after runTests has ruled out the two statuses that `go test` also folds
+// into exit 1 — a test timeout and a build failure — so a 1 here really is a
+// failing test, which is a detection. Status 2 is what a test BINARY returns
+// when it panics; `go test` does not surface it, but a direct binary invocation
+// would, and it means the mutant was never adjudicated.
 func getTestFailedStatus(exitCode int) mutator.Status {
 	switch exitCode {
 	case 1:
