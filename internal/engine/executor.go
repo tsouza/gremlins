@@ -488,10 +488,31 @@ func shutdownStatus() mutator.Status {
 	return mutator.NotCovered
 }
 
+// vetOff disables the `go vet` subset that `go test` runs before it builds
+// anything.
+//
+// That subset is not the compiler, and the difference matters here. Its `bools`
+// analyzer reports a conjunction of equalities against distinct operands —
+// `name == a && name == b` — as "suspect and", and `go test` turns that into
+// `FAIL pkg [build failed]` even though `go build` accepts the file without a
+// word. That shape is precisely what INVERT_LOGICAL produces from the very
+// common `name == a || name == b`, so with vet on, a whole class of mutants
+// could never reach a test binary.
+//
+// Every one of them is legal Go and a real change of behaviour: the mutated
+// predicate is unsatisfiable where the original was not, and a suite that
+// exercises either operand kills it. Refusing to GENERATE them would be the
+// wrong fix — that removes from the corpus mutants the suite ought to be asked
+// about, which is the one direction a mutation tool must never shrink in. What
+// is wrong is asking a style analyzer whether a mutant may be adjudicated at
+// all, so the analyzer is taken out of the loop instead. It also removes a vet
+// pass from every mutant's build, on a tool whose cost is dominated by builds.
+const vetOff = "-vet=off"
+
 func (m *mutantExecutor) getTestArgs(pkg string) []string {
-	args := []string{"test"}
+	args := []string{"test", vetOff}
 	if m.buildTags != "" {
-		args = append(args, "-tags", m.buildTags)
+		args = append(args, buildTagsFlag, m.buildTags)
 	}
 	// -timeout is the run-only leash, and it is deliberately the tighter of the
 	// two bounds: the Go toolchain starts it when the test binary starts, so a
