@@ -497,14 +497,14 @@ gremlins unleash --timeout-max=5s --compile-allowance=3m
 A malformed or non-positive value is reported on stderr and ignored, leaving
 the default allowance in place.
 
-!!! note "A timeout is read from the output, not the exit status"
+!!! note "Verdicts are read from the output, not the exit status"
     `go test` reports a failing test, a package that does not build and a test
     that ran past its `-timeout` all as exit status 1 — only the test *binary*
-    exits 2, and what Gremlins spawns is `go`. Taking that 1 at face value would
-    record a timed-out mutant as `KILLED`, crediting a detection that never
-    happened, so Gremlins scans the child's output for the timeout panic and
-    records `TIMED OUT` instead. The output is scanned as it streams and then
-    discarded, so a mutant that prints without bound cannot exhaust memory.
+    exits 2, and what Gremlins spawns is `go`. Gremlins therefore scans the
+    child's output to tell the three apart, so a timed-out mutant is recorded
+    `TIMED OUT` rather than credited as a detection, and a mutant that does not
+    compile is recorded `NOT VIABLE`. The output is scanned as it streams and
+    then discarded, so a mutant that prints without bound cannot exhaust memory.
 
 [//]: # (@formatter:off)
 !!! note "Result Consistency"

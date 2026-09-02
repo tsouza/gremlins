@@ -32,10 +32,10 @@ import (
 
 // These tests drive the REAL `go` toolchain rather than a stubbed exec, because
 // the thing under test is precisely how gremlins reads what `go test` reports.
-// A stub could be made to say anything; only the real command shows that a
+// A stub could be made to say anything; only the real command proves that a
 // timed-out mutant, a mutant that does not compile and a mutant that is killed
-// all arrive as the same exit status 1, so a stub asserting exit codes would be
-// asserting a fiction.
+// are told apart. `go test` gives all three the same exit status 1, so a stub
+// asserting exit codes would be asserting a fiction.
 
 // baselineElapsed is the "how long the package's own tests take" figure fed to
 // NewExecutorDealer, and runBoundCoefficient multiplies it. Together they put
@@ -213,19 +213,10 @@ func TestVerdictsFromRealGoTest(t *testing.T) {
 			want: mutator.Killed,
 		},
 		{
-			// The case the timeout classification must not swallow, pinned at
-			// the verdict it actually reaches rather than the one it deserves.
-			// `go test` exits 1 for a build failure exactly as it does for a
-			// failing test, so this mutant is booked KILLED — the suite
-			// credited for a detection against source a compiler rejected.
-			//
-			// Separating it needs the mutators fixed as well as the verdict:
-			// gremlins mutates the unary address-of `&` as if it were bitwise
-			// AND, so `&Foo{}` becomes `|Foo{}` and a large share of a
-			// package's mutants cannot compile at all. Classifying without
-			// removing them moves noise between columns. Tracked in cerberus
-			// issue #2930; this case is what turns red when it is fixed.
-			name: "a mutant that does not compile still reaches the exit-status path",
+			// The case the timeout classification must not swallow. `go test`
+			// exits 1 here, exactly as it does for a failing test, so reading
+			// the exit status alone would credit a detection that never ran.
+			name: "a mutant that does not compile is NOT VIABLE",
 			fx: goTestFixture{
 				sources: map[string]string{
 					"verdict.go":      uncompilableSource,
@@ -234,13 +225,13 @@ func TestVerdictsFromRealGoTest(t *testing.T) {
 				runBound:         "60s",
 				compileAllowance: generousCompileAllowance,
 			},
-			want: mutator.Killed,
+			want: mutator.NotViable,
 		},
 		{
 			// The run-only leash firing. TIMED OUT stays in the efficacy
-			// denominator and credits nobody; KILLED — which is where the exit
-			// status alone would put it, as the case above shows — would credit
-			// a detection that never happened.
+			// denominator and credits nobody; KILLED would credit a detection
+			// that never happened, and NOT VIABLE would drop the mutant out of
+			// the denominator altogether.
 			name: "a test that does not terminate is TIMED OUT",
 			fx: goTestFixture{
 				sources:          map[string]string{"verdict.go": baseSource, "verdict_test.go": nonTerminatingTest},
