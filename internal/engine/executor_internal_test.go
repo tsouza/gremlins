@@ -123,27 +123,40 @@ func TestOutputScanner(t *testing.T) {
 			if !sut.sawTestTimeout() {
 				t.Fatalf("marker split after %d bytes went unnoticed", i)
 			}
+			if sut.sawBuildFailure() {
+				t.Fatalf("marker split after %d bytes was also read as a build failure", i)
+			}
 		}
 	})
 
-	t.Run("the other exit-1 outcomes trip nothing", func(t *testing.T) {
+	t.Run("recognises a build failure and a setup failure", func(t *testing.T) {
 		t.Parallel()
 
-		// Both of these leave `go test`'s exit status 1 to speak for itself. A
-		// failing test is a detection and belongs there; a build failure is not,
-		// and is the subject of cerberus issue #2930.
 		for name, output := range map[string]string{
-			"a failing test": "--- FAIL: TestX (0.00s)\n    x_test.go:9: boom\n" +
-				"FAIL\texample.com/pkg\t0.005s\n",
-			"a build failure": "# example.com/pkg [example.com/pkg.test]\n" +
+			"build": "# example.com/pkg [example.com/pkg.test]\n" +
 				"./x.go:5:2: undefined: missing\nFAIL\texample.com/pkg [build failed]\n",
+			"setup": "FAIL\texample.com/pkg [setup failed]\n",
 		} {
 			sut := newOutputScanner()
 			mustWrite(t, sut, output)
 
-			if sut.sawTestTimeout() {
-				t.Errorf("%s was read as a timeout", name)
+			if !sut.sawBuildFailure() {
+				t.Errorf("%s failure went unnoticed", name)
 			}
+			if sut.sawTestTimeout() {
+				t.Errorf("%s failure was also read as a timeout", name)
+			}
+		}
+	})
+
+	t.Run("an ordinary failure trips neither marker", func(t *testing.T) {
+		t.Parallel()
+
+		sut := newOutputScanner()
+		mustWrite(t, sut, "--- FAIL: TestX (0.00s)\n    x_test.go:9: boom\nFAIL\texample.com/pkg\t0.005s\n")
+
+		if sut.sawTestTimeout() || sut.sawBuildFailure() {
+			t.Error("a failing test must be left to the exit status, which makes it a detection")
 		}
 	})
 
