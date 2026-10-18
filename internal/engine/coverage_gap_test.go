@@ -105,6 +105,44 @@ func Send(ch chan int, a, b int) {
 	}
 }
 
+func List(a int) int {
+	switch {
+	case a > 10, a < -10: // first reached, second unreached
+		return 1
+	}
+	return 0
+}
+
+func ListThrough(a int) int {
+	switch {
+	case a > 10, a < -10: // reached
+		return 1
+	default:
+		return 0
+	}
+}
+
+func Recv(arr []int, i int, ch, other chan int) {
+	select {
+	case arr[i+1] = <-ch: // unreached
+	case <-other:
+	}
+}
+
+func Labeled(x int) int {
+	n := 0
+	switch {
+	case x > 0: // reached
+		n++
+		goto L
+	L:
+		fallthrough
+	case x < 5: // unreached
+		n += 10
+	}
+	return n
+}
+
 func Unreached(a, b int) int {
 	switch {
 	case a > b: // unreached
@@ -142,6 +180,12 @@ func TestClassify(t *testing.T) {
 	if Default(0) != 0 {
 		t.Fatal("default")
 	}
+	if List(20) != 1 || ListThrough(0) != 0 || Labeled(1) != 11 {
+		t.Fatal("list")
+	}
+	ready := make(chan int, 1)
+	ready <- 1
+	Recv(make([]int, 2), 0, make(chan int), ready)
 	ch := make(chan int, 1)
 	Send(ch, 1, 2)
 	if <-ch != 3 {
@@ -149,6 +193,15 @@ func TestClassify(t *testing.T) {
 	}
 }
 `
+
+// mixedListTag marks the line of List's two-expression case, whose first
+// expression the test evaluates and whose second it never does: the list
+// matches at its first expression. mixedListSecondCol is the column past the
+// first expression.
+const (
+	mixedListTag       = "first reached, second unreached"
+	mixedListSecondCol = 13
+)
 
 // gapRunBound is far above what gapTest takes; nothing here is timing-bound.
 const gapRunBound = "1m"
@@ -200,6 +253,12 @@ func TestMutantsOutsideEveryCoverBlockAreRun(t *testing.T) {
 		tag := tags[m.Position().Line]
 		if tag == "" {
 			continue
+		}
+		if tag == mixedListTag {
+			tag = "reached"
+			if m.Position().Column > mixedListSecondCol {
+				tag = "unreached"
+			}
 		}
 		seen[tag]++
 		t.Logf("%-9s %s %s: %s", tag, m.Position(), m.Type(), m.Status())

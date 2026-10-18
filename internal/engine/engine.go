@@ -276,12 +276,14 @@ func (mu *Engine) mutationStatus(set *token.FileSet, tokPos token.Pos, ancestors
 //
 // An expression of a switch's case list is evaluated only when the switch got
 // that far: caseReached reads that off the clause bodies the profile records.
-// Every other gap is evaluated whenever its enclosing statement runs, so its
-// coverage is that statement's: the nearest enclosing statement whose position
-// the profile does instrument. That is the grain the cover tool applies
-// everywhere else, where `if a || b` is covered when `b` is short-circuited
-// away. A select's communication clauses are of this kind: entering a select
-// evaluates every one of them.
+// The left-hand side of a select's receive is evaluated only when its case is
+// selected, which its body records. Every other gap is evaluated whenever its
+// enclosing statement runs, so its coverage is that statement's: the nearest
+// enclosing statement whose position the profile does instrument. That is the
+// grain the cover tool applies everywhere else, where `if a || b` is covered
+// when `b` is short-circuited away. The rest of a select's communication
+// clauses are of this kind: entering a select evaluates the channel and value
+// operands of every one of them.
 //
 // ancestors is the path from the file down to the node carrying the token,
 // innermost last. The walk never leaves the function the position is in, so a
@@ -302,10 +304,17 @@ func (mu *Engine) reached(set *token.FileSet, tokPos token.Pos, ancestors []ast.
 		case *ast.CaseClause:
 			if tokPos < n.Colon && i >= 2 {
 				if body, ok := ancestors[i-1].(*ast.BlockStmt); ok {
-					return caseReached(set, cov, body, n)
+					return caseReached(set, cov, body, n, tokPos)
 				}
 			}
-		case *ast.BlockStmt, *ast.CommClause:
+		case *ast.CommClause:
+			// A receive's left-hand side is evaluated only when its case is
+			// the one selected, so it is reached when that case's body ran.
+			if as, ok := n.Comm.(*ast.AssignStmt); ok && len(as.Lhs) > 0 &&
+				tokPos >= as.Lhs[0].Pos() && tokPos < as.Lhs[len(as.Lhs)-1].End() {
+				return bodyRan(set, cov, n.Colon)
+			}
+		case *ast.BlockStmt:
 			continue
 		case ast.Stmt:
 			stmtPos := set.Position(n.Pos())
@@ -318,52 +327,80 @@ func (mu *Engine) reached(set *token.FileSet, tokPos token.Pos, ancestors []ast.
 	return false
 }
 
-// caseReached reports whether a test evaluated the case list of clause, one
-// of the clauses of a switch whose body is body.
-//
-// A switch evaluates its case lists in order and stops at the first match, and
-// it takes the default clause only after every list failed. So clause's list
-// was evaluated when the default clause's body ran, wherever it sits, or when
-// the body of clause or of any clause after it ran. A body entered through the
-// previous clause's fallthrough was not selected by its own list, or by every
-// list failing, and proves nothing. A switch whose lists all failed with no default clause
-// to take leaves no trace in the profile, so that evaluation is not credited.
-func caseReached(set *token.FileSet, cov coverage.Profile, body *ast.BlockStmt, clause *ast.CaseClause) bool {
-	ran := func(c *ast.CaseClause) bool {
-		p := set.Position(c.Colon + 1)
+// bodyRan reports whether a test executed the clause body that starts after
+// the colon at colon.
+func bodyRan(set *token.FileSet, cov coverage.Profile, colon token.Pos) bool {
+	p := set.Position(colon + 1)
 
-		return cov.InBlock(p) && cov.IsCovered(p)
-	}
+	return cov.InBlock(p) && cov.IsCovered(p)
+}
+
+// caseReached reports whether a test evaluated the expression at tokPos in the
+// case list of clause, one of the clauses of a switch whose body is body.
+//
+// A switch evaluates its case lists in order, and each list's expressions in
+// order, and stops at the first match; it takes the default clause only after
+// every expression failed. So every expression of clause's list was evaluated
+// when the default clause's body ran, wherever it sits, or when the body of
+// any clause after it ran. The body of clause itself proves only that its
+// first expression was evaluated: the list may have matched there. A body
+// entered through the previous clause's fallthrough was not selected by any
+// list, and proves nothing. A switch whose lists all failed with no default
+// clause to take leaves no trace in the profile, so that evaluation is not
+// credited.
+func caseReached(set *token.FileSet, cov coverage.Profile, body *ast.BlockStmt, clause *ast.CaseClause, tokPos token.Pos) bool {
+	first := len(clause.List) > 0 && tokPos < clause.List[0].End()
 	after := false
 	for i, st := range body.List {
 		c, ok := st.(*ast.CaseClause)
 		if !ok {
 			continue
 		}
-		if c == clause {
-			after = true
+		own := c == clause
+		if !bodyRan(set, cov, c.Colon) || enteredByFallthrough(body, i) {
+			after = after || own
+
+			continue
 		}
-		selected := ran(c) && !enteredByFallthrough(body, i)
-		if selected && (c.List == nil || after) {
+		if c.List == nil || after || (own && first) {
 			return true
 		}
+		after = after || own
 	}
 
 	return false
 }
 
 // enteredByFallthrough reports whether the clause before body.List[i] ends in
-// a fallthrough statement, through which body.List[i]'s body can be entered
-// without its case list matching.
+// a fallthrough statement, labelled or not, through which body.List[i]'s body
+// can be entered without its case list matching.
 func enteredByFallthrough(body *ast.BlockStmt, i int) bool {
 	if i == 0 {
 		return false
 	}
 	prev, ok := body.List[i-1].(*ast.CaseClause)
-	if !ok || len(prev.Body) == 0 {
+	if !ok {
 		return false
 	}
-	br, ok := prev.Body[len(prev.Body)-1].(*ast.BranchStmt)
+	stmts := prev.Body
+	for len(stmts) > 0 {
+		if _, empty := stmts[len(stmts)-1].(*ast.EmptyStmt); !empty {
+			break
+		}
+		stmts = stmts[:len(stmts)-1]
+	}
+	if len(stmts) == 0 {
+		return false
+	}
+	last := stmts[len(stmts)-1]
+	for {
+		l, ok := last.(*ast.LabeledStmt)
+		if !ok {
+			break
+		}
+		last = l.Stmt
+	}
+	br, ok := last.(*ast.BranchStmt)
 
 	return ok && br.Tok == token.FALLTHROUGH
 }
