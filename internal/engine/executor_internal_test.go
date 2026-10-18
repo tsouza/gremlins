@@ -186,3 +186,30 @@ func mustWrite(t *testing.T, sut *outputScanner, s string) {
 		t.Fatalf("Write(%d bytes) = %d, %v", len(s), n, err)
 	}
 }
+
+// TestABuildFailureIsTheMutationsOnlyWhenItNamesTheFile pins which build
+// failures the verdict cache may keep as NOT VIABLE.
+func TestABuildFailureIsTheMutationsOnlyWhenItNamesTheFile(t *testing.T) {
+	diagnostics := []string{"\n/work/x.go:", "\nx.go:", "\n./x.go:"}
+	testCases := []struct {
+		name   string
+		output string
+		want   bool
+	}{
+		{name: "a diagnostic in the mutated file", output: "# pkg\n./x.go:5:2: undefined: missing\nFAIL\tpkg [build failed]\n", want: true},
+		{name: "a diagnostic in a file whose name ends the same way", output: "# pkg\n./xx.go:5:2: undefined: missing\nFAIL\tpkg [build failed]\n"},
+		{name: "a diagnostic in another file", output: "# pkg\n./y.go:5:2: undefined: missing\nFAIL\tpkg [build failed]\n"},
+		{name: "a killed compiler", output: "# pkg\ncompile: signal: killed\nFAIL\tpkg [build failed]\n"},
+		{name: "a setup failure", output: "x.go:1:1: no required module\nFAIL\tpkg [setup failed]\n"},
+		{name: "no failure", output: "./x.go:5:2: a line the test printed\nok\tpkg\n"},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newOutputScanner(diagnostics...)
+			_, _ = s.Write([]byte(tc.output))
+			if got := buildFailedOnMutation(s, diagnostics); got != tc.want {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

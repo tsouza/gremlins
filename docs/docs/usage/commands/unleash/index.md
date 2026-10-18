@@ -522,6 +522,86 @@ the default allowance in place.
     indicate an issue.
 [//]: # (@formatter:on)
 
+### Cache dir
+
+:material-flag: `--cache-dir` · :material-sign-direction: Default: `""` (no cache)
+
+A directory in which each adjudicated mutant's verdict is stored under a key
+derived from the content of everything the verdict depends on. A later run over
+the same content reuses the stored verdict instead of running the mutant's tests.
+The directory must lie outside the module.
+
+The key holds the Gremlins binary, the Go toolchain and its build environment,
+the environment the test binaries inherit (every variable but `PWD`, `OLDPWD`,
+`SHLVL`, `_`, `GOTMPDIR` and the ones `--cache-env-ignore` names),
+`--cache-salt`, `--tags` and `--test-cpu`, the mutation (file, mutator, position
+and the mutated file's content), and the content of the mutated package's
+`go test` dependency closure from `go list -deps -test <pkg>`. A package outside
+the module contributes the files that build it. A package inside the module
+contributes every file of its directory tree, stopping at a nested module; the
+test files of a package other than the mutated one are left out. `go.mod`,
+`go.sum`, and any `go.work` and `go.work.sum` complete it.
+
+The mutant's test binary is also run with `-test.testlogfile`, the log `go test`
+uses for its own result cache, and `-test.memprofile`, which the binary writes
+only after it has flushed that log. The entry records a digest of every file the
+tests opened or stat-ed, a missing one included, and of every environment
+variable they read. Paths under `GOROOT`, the module cache, the build cache and
+Gremlins' own working directory are not recorded. A lookup misses when any
+recorded input differs. The digests
+are taken from the copy the test ran in, and the entry is stored only when that
+copy still holds the content the key describes.
+
+| status                       | stored                                                                    |
+|------------------------------|---------------------------------------------------------------------------|
+| `KILLED`                     | only with a complete test log                                             |
+| `LIVED`                      | only with a complete test log and a `go test` that exited 0               |
+| `NOT VIABLE`                 | only for a build failure whose compiler diagnostic names the mutated file |
+| `TIMED OUT`, `RUN TIMED OUT` | never                                                                     |
+| a shutdown status            | never                                                                     |
+
+The run bound is not part of the key. An entry that is malformed, corrupted, or
+does not match is a miss. The cache is not used in integration mode or in a dry
+run.
+
+```shell
+gremlins unleash --cache-dir="$HOME/.cache/gremlins"
+```
+
+### Cache salt
+
+:material-flag: `--cache-salt` · :material-sign-direction: Default: `""`
+
+A string entered into every cache key, for anything that can change a verdict
+and that Gremlins cannot see:
+
+- a `go test -exec` wrapper named in `GOFLAGS`, whose path is in the key but
+  whose content is not;
+- files a package-level initialiser or a `TestMain` reads outside the package
+  trees of the closure, which no test log records;
+- what a child process started by a test reads;
+- anything a test reaches over a network.
+
+```shell
+gremlins unleash --cache-dir="$HOME/.cache/gremlins" --cache-salt="$(sha256sum wrapper.sh)"
+```
+
+### Cache env ignore
+
+:material-flag: `--cache-env-ignore` · :material-sign-direction: Default: `[]`
+
+Environment variables left out of every cache key, each a name or a prefix
+ending in `*`. Because the key holds the whole environment, a variable whose
+value changes on every run, such as a CI system's run or job identifier
+(`GITHUB_RUN_ID`, `CI_JOB_ID`), makes every lookup miss until it is listed
+here. List only variables that nothing reads before a test starts: a test's own
+reads of them are still recorded, but a read by a package-level initialiser or
+by a `TestMain` before `testing.M.Run` is not.
+
+```shell
+gremlins unleash --cache-dir="$HOME/.cache/gremlins" --cache-env-ignore='GITHUB_RUN_*,RUNNER_TRACKING_ID'
+```
+
 ### On-shutdown status
 
 :material-flag: `--on-shutdown-status` · :material-sign-direction: Default: `not-run`
