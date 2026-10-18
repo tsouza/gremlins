@@ -256,7 +256,7 @@ func (mu *Engine) mutationStatus(set *token.FileSet, tokPos token.Pos, ancestors
 	// The diff names files relative to the module root, and pos relative to
 	// the directory the run is scoped to.
 	modPos := pos
-	modPos.Filename = filepath.ToSlash(filepath.Join(mu.module.CallingDir, pos.Filename))
+	modPos.Filename = mu.module.ModulePath(pos.Filename)
 	if !mu.codeData.Diff.IsChanged(modPos) {
 		status = mutator.Skipped
 	}
@@ -272,43 +272,100 @@ func (mu *Engine) mutationStatus(set *token.FileSet, tokPos token.Pos, ancestors
 // its colon, and the switch head's ends at the switch's opening brace), and
 // whatever follows a closure argument in a statement (the enclosing block ends
 // where the closure starts, the closure's body is a block of its own, and the
-// next block starts at the statement's own body). Such a position is evaluated
-// whenever its enclosing statement runs, so its coverage is that statement's:
-// the nearest enclosing statement whose position the profile does instrument.
-// A clause and its body are not that statement — their positions are the very
-// gap being resolved — so the walk goes on to the switch or select that
-// evaluates the clause.
+// next block starts at the statement's own body).
 //
-// This is statement grain, the same grain the cover tool already applies
-// everywhere else: it marks `if a || b` covered when `b` is short-circuited
-// away, and a later `case` covered when an earlier one always matches.
+// An expression of a switch's case list is evaluated only when the switch got
+// that far: caseReached reads that off the clause bodies the profile records.
+// Every other gap is evaluated whenever its enclosing statement runs, so its
+// coverage is that statement's: the nearest enclosing statement whose position
+// the profile does instrument. That is the grain the cover tool applies
+// everywhere else, where `if a || b` is covered when `b` is short-circuited
+// away. A select's communication clauses are of this kind: entering a select
+// evaluates every one of them.
 //
 // ancestors is the path from the file down to the node carrying the token,
-// innermost last. The walk never leaves the function the position is in. A position whose
-// nearest instrumented statement is in a block no test executed is not
-// reached: the gap rule reads only gaps and never promotes a block the profile
-// says is dead.
+// innermost last. The walk never leaves the function the position is in, so a
+// closure no test calls is never credited with its enclosing statement. A
+// position whose nearest instrumented statement is in a block no test executed
+// is not reached: the gap rule reads only gaps and never promotes a block the
+// profile says is dead.
 func (mu *Engine) reached(set *token.FileSet, tokPos token.Pos, ancestors []ast.Node) bool {
+	cov := mu.codeData.Cov
 	pos := set.Position(tokPos)
-	if mu.codeData.Cov.InBlock(pos) {
-		return mu.codeData.Cov.IsCovered(pos)
+	if cov.InBlock(pos) {
+		return cov.IsCovered(pos)
 	}
 	for i := len(ancestors) - 1; i >= 0; i-- {
-		n := ancestors[i]
-		switch n.(type) {
+		switch n := ancestors[i].(type) {
 		case *ast.FuncLit, *ast.FuncDecl:
 			return false
-		case *ast.BlockStmt, *ast.CaseClause, *ast.CommClause:
+		case *ast.CaseClause:
+			if tokPos < n.Colon && i >= 2 {
+				if body, ok := ancestors[i-1].(*ast.BlockStmt); ok {
+					return caseReached(set, cov, body, n)
+				}
+			}
+		case *ast.BlockStmt, *ast.CommClause:
 			continue
 		case ast.Stmt:
 			stmtPos := set.Position(n.Pos())
-			if mu.codeData.Cov.InBlock(stmtPos) {
-				return mu.codeData.Cov.IsCovered(stmtPos)
+			if cov.InBlock(stmtPos) {
+				return cov.IsCovered(stmtPos)
 			}
 		}
 	}
 
 	return false
+}
+
+// caseReached reports whether a test evaluated the case list of clause, one
+// of the clauses of a switch whose body is body.
+//
+// A switch evaluates its case lists in order and stops at the first match, and
+// it takes the default clause only after every list failed. So clause's list
+// was evaluated when the default clause's body ran, wherever it sits, or when
+// the body of clause or of any clause after it ran. A body entered through the
+// previous clause's fallthrough was not selected by its own list, or by every
+// list failing, and proves nothing. A switch whose lists all failed with no default clause
+// to take leaves no trace in the profile, so that evaluation is not credited.
+func caseReached(set *token.FileSet, cov coverage.Profile, body *ast.BlockStmt, clause *ast.CaseClause) bool {
+	ran := func(c *ast.CaseClause) bool {
+		p := set.Position(c.Colon + 1)
+
+		return cov.InBlock(p) && cov.IsCovered(p)
+	}
+	after := false
+	for i, st := range body.List {
+		c, ok := st.(*ast.CaseClause)
+		if !ok {
+			continue
+		}
+		if c == clause {
+			after = true
+		}
+		selected := ran(c) && !enteredByFallthrough(body, i)
+		if selected && (c.List == nil || after) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// enteredByFallthrough reports whether the clause before body.List[i] ends in
+// a fallthrough statement, through which body.List[i]'s body can be entered
+// without its case list matching.
+func enteredByFallthrough(body *ast.BlockStmt, i int) bool {
+	if i == 0 {
+		return false
+	}
+	prev, ok := body.List[i-1].(*ast.CaseClause)
+	if !ok || len(prev.Body) == 0 {
+		return false
+	}
+	br, ok := prev.Body[len(prev.Body)-1].(*ast.BranchStmt)
+
+	return ok && br.Tok == token.FALLTHROUGH
 }
 
 func (mu *Engine) executeTests(ctx context.Context) report.Results {
