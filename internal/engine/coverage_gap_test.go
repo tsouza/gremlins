@@ -36,8 +36,9 @@ import (
 //
 //   - `// reached` lines are evaluated by the test below, so every mutant on
 //     them must get a real verdict.
-//   - `// unreached` lines sit in a function no test calls, or under a branch
-//     no test takes, so their mutants must stay NOT COVERED. They are what
+//   - `// unreached` lines sit in a function no test calls, under a branch no
+//     test takes, behind a case that always matches, or behind a fallthrough,
+//     so their mutants must stay NOT COVERED. They are what
 //     keeps the fix from reporting coverage the profile does not support.
 const gapSource = `package gap
 
@@ -62,6 +63,46 @@ func Classify(a, b int) int {
 		}
 	}
 	return 0
+}
+
+func Always(a int) int {
+	switch {
+	case a >= 0: // reached
+		return 1
+	case a > 5: // unreached
+		return 2
+	}
+	return 0
+}
+
+func Through(a int) int {
+	n := 0
+	switch {
+	case a > 0: // reached
+		n++
+		fallthrough
+	case a > 10: // unreached
+		n += 10
+	}
+	return n
+}
+
+func Default(a int) int {
+	switch {
+	case a > 0: // reached
+		return 1
+	case a < -5: // reached
+		return 2
+	default:
+		return 0
+	}
+}
+
+func Send(ch chan int, a, b int) {
+	select {
+	case ch <- a + b: // reached
+	default:
+	}
 }
 
 func Unreached(a, b int) int {
@@ -91,6 +132,20 @@ func TestClassify(t *testing.T) {
 	}
 	if Classify(1, 1) != 0 {
 		t.Fatal("1 == 1")
+	}
+	if Always(1) != 1 {
+		t.Fatal("always")
+	}
+	if Through(1) != 11 {
+		t.Fatal("through")
+	}
+	if Default(0) != 0 {
+		t.Fatal("default")
+	}
+	ch := make(chan int, 1)
+	Send(ch, 1, 2)
+	if <-ch != 3 {
+		t.Fatal("send")
 	}
 }
 `
