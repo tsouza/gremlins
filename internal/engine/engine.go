@@ -150,18 +150,29 @@ func (mu *Engine) runOnFile(fileName string) {
 	file, _ := parser.ParseFile(set, fileName, src, parser.ParseComments)
 	_ = src.Close()
 
+	// ancestors is the path from the file down to the node being visited,
+	// kept here rather than recomputed per mutant: a mutant emitted earlier
+	// in this walk may already be rewriting its token in an executor, and a
+	// later walk over the whole tree would read that token concurrently.
+	var ancestors []ast.Node
 	ast.Inspect(file, func(node ast.Node) bool {
+		if node == nil {
+			ancestors = ancestors[:len(ancestors)-1]
+
+			return true
+		}
+		ancestors = append(ancestors, node)
 		n, ok := NewTokenNode(node)
 		if !ok {
 			return true
 		}
-		mu.findMutations(fileName, set, file, n)
+		mu.findMutations(fileName, set, file, n, ancestors)
 
 		return true
 	})
 }
 
-func (mu *Engine) findMutations(fileName string, set *token.FileSet, file *ast.File, node *NodeToken) {
+func (mu *Engine) findMutations(fileName string, set *token.FileSet, file *ast.File, node *NodeToken, ancestors []ast.Node) {
 	mutantTypes, ok := MutantTypesFor(node)
 	if !ok {
 		return
@@ -169,17 +180,23 @@ func (mu *Engine) findMutations(fileName string, set *token.FileSet, file *ast.F
 
 	pkg := mu.pkgName(fileName, file.Name.Name)
 	position := set.Position(node.TokPos)
+	// Everything read off the node is read before the first of its mutants
+	// is emitted. From then on an executor may be rewriting the node's token
+	// in place (TokenMutator.Apply), so a later read would race with it and
+	// could see the mutated token instead of the source's.
+	tok := node.Tok()
+	status := mu.mutationStatus(set, node.TokPos, ancestors)
 	for _, mt := range mutantTypes {
 		if !configuration.Get[bool](configuration.MutantTypeEnabledKey(mt)) {
 			continue
 		}
-		if !mu.viable(position, node.Tok(), mt) {
+		if !mu.viable(position, tok, mt) {
 			continue
 		}
 		mutantType := mt
 		tm := NewTokenMutant(pkg, set, file, node)
 		tm.SetType(mutantType)
-		tm.SetStatus(mu.mutationStatus(set.Position(node.TokPos)))
+		tm.SetStatus(status)
 
 		mu.mutantStream <- tm
 	}
@@ -228,10 +245,11 @@ func normalisePkgPath(pkg string) string {
 	return strings.ReplaceAll(pkg, sep, "/")
 }
 
-func (mu *Engine) mutationStatus(pos token.Position) mutator.Status {
+func (mu *Engine) mutationStatus(set *token.FileSet, tokPos token.Pos, ancestors []ast.Node) mutator.Status {
 	var status mutator.Status
+	pos := set.Position(tokPos)
 
-	if mu.codeData.Cov.IsCovered(pos) {
+	if mu.reached(set, tokPos, ancestors) {
 		status = mutator.Runnable
 	}
 
@@ -240,6 +258,53 @@ func (mu *Engine) mutationStatus(pos token.Position) mutator.Status {
 	}
 
 	return status
+}
+
+// reached reports whether a test executed the code at tokPos.
+//
+// A position inside a block of the cover profile is reached when a test
+// executed that block. Go's cover tool leaves some evaluated expressions
+// outside every block: a `case` expression (the clause's block starts after
+// its colon, and the switch head's ends at the switch's opening brace), and
+// whatever follows a closure argument in a statement (the enclosing block ends
+// where the closure starts, the closure's body is a block of its own, and the
+// next block starts at the statement's own body). Such a position is evaluated
+// whenever its enclosing statement runs, so its coverage is that statement's:
+// the nearest enclosing statement whose position the profile does instrument.
+// A clause and its body are not that statement — their positions are the very
+// gap being resolved — so the walk goes on to the switch or select that
+// evaluates the clause.
+//
+// This is statement grain, the same grain the cover tool already applies
+// everywhere else: it marks `if a || b` covered when `b` is short-circuited
+// away, and a later `case` covered when an earlier one always matches.
+//
+// ancestors is the path from the file down to the node carrying the token,
+// innermost last. The walk never leaves the function the position is in. A position whose
+// nearest instrumented statement is in a block no test executed is not
+// reached: the gap rule reads only gaps and never promotes a block the profile
+// says is dead.
+func (mu *Engine) reached(set *token.FileSet, tokPos token.Pos, ancestors []ast.Node) bool {
+	pos := set.Position(tokPos)
+	if mu.codeData.Cov.InBlock(pos) {
+		return mu.codeData.Cov.IsCovered(pos)
+	}
+	for i := len(ancestors) - 1; i >= 0; i-- {
+		n := ancestors[i]
+		switch n.(type) {
+		case *ast.FuncLit, *ast.FuncDecl:
+			return false
+		case *ast.BlockStmt, *ast.CaseClause, *ast.CommClause:
+			continue
+		case ast.Stmt:
+			stmtPos := set.Position(n.Pos())
+			if mu.codeData.Cov.InBlock(stmtPos) {
+				return mu.codeData.Cov.IsCovered(stmtPos)
+			}
+		}
+	}
+
+	return false
 }
 
 func (mu *Engine) executeTests(ctx context.Context) report.Results {
