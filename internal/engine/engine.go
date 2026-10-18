@@ -253,7 +253,11 @@ func (mu *Engine) mutationStatus(set *token.FileSet, tokPos token.Pos, ancestors
 		status = mutator.Runnable
 	}
 
-	if !mu.codeData.Diff.IsChanged(pos) {
+	// The diff names files relative to the module root, and pos relative to
+	// the directory the run is scoped to.
+	modPos := pos
+	modPos.Filename = filepath.ToSlash(filepath.Join(mu.module.CallingDir, pos.Filename))
+	if !mu.codeData.Diff.IsChanged(modPos) {
 		status = mutator.Skipped
 	}
 
