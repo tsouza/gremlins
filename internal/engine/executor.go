@@ -194,7 +194,7 @@ func newCache(mod gomodule.GoModule, buildTags string, testCPU int, dryRun, inte
 		Tags:      buildTags,
 		TestCPU:   testCPU,
 		Env:       os.Environ(),
-		EnvIgnore: configuration.GetStringSlice(configuration.UnleashCacheEnvIgnoreKey),
+		EnvIgnore: CacheEnvIgnore(),
 	})
 	if err != nil {
 		log.Errorf("verdict cache disabled: %v\n", err)
@@ -203,6 +203,23 @@ func newCache(mod gomodule.GoModule, buildTags string, testCPU int, dryRun, inte
 	}
 
 	return c
+}
+
+// CacheEnvIgnore returns the --cache-env-ignore patterns. Each value given is
+// a comma-separated list, and the flag may also be repeated; no environment
+// variable name contains a comma, so splitting never breaks a pattern apart.
+// Empty items are dropped.
+func CacheEnvIgnore() []string {
+	var out []string
+	for _, v := range configuration.GetStringSlice(configuration.UnleashCacheEnvIgnoreKey) {
+		for _, p := range strings.Split(v, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				out = append(out, p)
+			}
+		}
+	}
+
+	return out
 }
 
 // CacheStats reports how many verdicts the cache served, how many it stored,
