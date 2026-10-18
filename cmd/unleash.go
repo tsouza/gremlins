@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -62,6 +63,9 @@ const (
 	paramTimeoutMax         = "timeout-max"
 	paramCompileAllowance   = "compile-allowance"
 	paramOnShutdownStatus   = "on-shutdown-status"
+	paramCacheDir           = "cache-dir"
+	paramCacheSalt          = "cache-salt"
+	paramCacheEnvIgnore     = "cache-env-ignore"
 
 	// Thresholds.
 	paramThresholdEfficacy  = "threshold-efficacy"
@@ -115,6 +119,9 @@ func runUnleash(ctx context.Context) func(cmd *cobra.Command, args []string) err
 		if err != nil {
 			return fmt.Errorf("not in a Go module: %w", err)
 		}
+		if err := resolveCacheDir(mod.Root); err != nil {
+			return err
+		}
 
 		workDir, err := os.MkdirTemp(os.TempDir(), "gremlins-")
 		if err != nil {
@@ -141,6 +148,31 @@ func runUnleash(ctx context.Context) func(cmd *cobra.Command, args []string) err
 
 		return report.Do(results)
 	}
+}
+
+// resolveCacheDir makes --cache-dir absolute before anything changes the
+// working directory, and refuses one inside the module: every worker copies the
+// module, so a cache there would be copied with it, and a test that walks its
+// own tree would record the cache as one of its inputs.
+func resolveCacheDir(modRoot string) error {
+	dir := configuration.Get[string](configuration.UnleashCacheDirKey)
+	if dir == "" {
+		return nil
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return fmt.Errorf("cannot resolve the verdict cache directory: %w", err)
+	}
+	root, err := filepath.Abs(modRoot)
+	if err != nil {
+		return fmt.Errorf("cannot resolve the module root: %w", err)
+	}
+	if rel, err := filepath.Rel(root, abs); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("the verdict cache directory %s lies inside the module %s; put it outside", abs, root)
+	}
+	configuration.Set(configuration.UnleashCacheDirKey, abs)
+
+	return nil
 }
 
 func runWithCancel(ctx context.Context, wg *sync.WaitGroup, runner func(c context.Context), onCancel func()) {
@@ -192,6 +224,9 @@ func run(ctx context.Context, mod gomodule.GoModule, workDir string) (report.Res
 
 	mut := engine.New(mod, codeData, jDealer)
 	results := mut.Run(ctx)
+	if hits, stores, ok := jDealer.CacheStats(); ok {
+		log.Infof("verdict cache: %d verdict(s) reused, %d stored\n", hits, stores)
+	}
 
 	return results, nil
 }
@@ -225,6 +260,9 @@ func setFlagsOnCmd(cmd *cobra.Command) error {
 		{Name: paramTimeoutCoefficient, CfgKey: configuration.UnleashTimeoutCoefficientKey, DefaultV: 0, Usage: "the coefficient by which the timeout is increased"},
 		{Name: paramTimeoutMax, CfgKey: configuration.UnleashTimeoutMaxKey, DefaultV: "", Usage: "absolute ceiling on a single mutant's test run, as a Go duration (e.g. '15s'); caps the coefficient-derived timeout so a non-terminating mutant cannot exhaust the machine. Empty means no ceiling"},
 		{Name: paramCompileAllowance, CfgKey: configuration.UnleashCompileAllowanceKey, DefaultV: "", Usage: "time a mutant is allowed to COMPILE, as a Go duration (e.g. '2m'), on top of the bound on its test run; the two together form the deadline that also bounds a compile that has hung. Empty uses the default"},
+		{Name: paramCacheDir, CfgKey: configuration.UnleashCacheDirKey, DefaultV: "", Usage: "directory of the verdict cache; a mutant whose key and recorded test inputs are unchanged reuses its stored verdict instead of running its tests. Empty disables the cache"},
+		{Name: paramCacheSalt, CfgKey: configuration.UnleashCacheSaltKey, DefaultV: "", Usage: "a string entered into every verdict cache key, for anything outside gremlins' view that can change a verdict"},
+		{Name: paramCacheEnvIgnore, CfgKey: configuration.UnleashCacheEnvIgnoreKey, DefaultV: []string{}, Usage: "environment variables left out of every verdict cache key, by name or by a prefix ending in '*'; for variables that change on every run and that nothing reads before a test starts. A test's own reads of them are still recorded"},
 		{Name: paramOnShutdownStatus, CfgKey: configuration.UnleashOnShutdownStatusKey, DefaultV: "not-run", Usage: "status to record for in-flight mutants when the run is cancelled (e.g. SIGTERM from a CI runner); one of 'not-run', 'timed-out', 'lived'"},
 	}
 
