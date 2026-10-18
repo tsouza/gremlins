@@ -23,10 +23,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/tsouza/gremlins/internal/cache"
 	"github.com/tsouza/gremlins/internal/configuration"
 	"github.com/tsouza/gremlins/internal/engine/workdir"
 	"github.com/tsouza/gremlins/internal/engine/workerpool"
@@ -99,6 +101,7 @@ type MutantExecutorDealer struct {
 	buildTags         string
 	testExecutionTime time.Duration
 	compileAllowance  time.Duration
+	cache             *cache.Cache
 	dryRun            bool
 	integrationMode   bool
 	testCPU           int
@@ -160,11 +163,56 @@ func NewExecutorDealer(mod gomodule.GoModule, wdd workdir.Dealer, elapsed time.D
 		execContext:       exec.CommandContext,
 	}
 
+	jd.cache = newCache(mod, buildTags, testCPU, dryRun, integrationMode)
+
 	for _, opt := range opts {
 		jd = opt(jd)
 	}
 
 	return &jd
+}
+
+// newCache opens the verdict cache when --cache-dir is set. It stays off for
+// a dry run, which adjudicates nothing, and in integration mode, where one
+// `go test ./...` runs several test binaries that would all write the same
+// test log. A cache that cannot be opened is reported and the run goes on
+// without one.
+func newCache(mod gomodule.GoModule, buildTags string, testCPU int, dryRun, integrationMode bool) *cache.Cache {
+	dir := configuration.Get[string](configuration.UnleashCacheDirKey)
+	if dir == "" || dryRun {
+		return nil
+	}
+	if integrationMode {
+		log.Infof("verdict cache is not used in integration mode\n")
+
+		return nil
+	}
+	c, err := cache.New(cache.Options{
+		Dir:       dir,
+		ModRoot:   mod.Root,
+		Salt:      configuration.Get[string](configuration.UnleashCacheSaltKey),
+		Tags:      buildTags,
+		TestCPU:   testCPU,
+		Env:       os.Environ(),
+		EnvIgnore: configuration.GetStringSlice(configuration.UnleashCacheEnvIgnoreKey),
+	})
+	if err != nil {
+		log.Errorf("verdict cache disabled: %v\n", err)
+
+		return nil
+	}
+
+	return c
+}
+
+// CacheStats reports how many verdicts the cache served, how many it stored,
+// and whether a cache was in use at all.
+func (m *MutantExecutorDealer) CacheStats() (int64, int64, bool) {
+	if m.cache == nil {
+		return 0, 0, false
+	}
+
+	return m.cache.Hits(), m.cache.Stores(), true
 }
 
 // cappedExecutionTime clamps the coefficient-derived bound on a mutant's test
@@ -265,6 +313,7 @@ func (m MutantExecutorDealer) NewExecutor(mut mutator.Mutator, outCh chan<- muta
 		testExecutionTime: m.testExecutionTime,
 		compileAllowance:  m.compileAllowance,
 		runCtx:            runCtx,
+		cache:             m.cache,
 	}
 
 	return &mj
@@ -279,6 +328,7 @@ type mutantExecutor struct {
 	wg                *sync.WaitGroup
 	execContext       execContext
 	runCtx            context.Context
+	cache             *cache.Cache
 	module            gomodule.GoModule
 	buildTags         string
 	testExecutionTime time.Duration
@@ -322,14 +372,140 @@ func (m *mutantExecutor) Start(w *workerpool.Worker) {
 		return
 	}
 
-	m.mutant.SetStatus(m.runTests(rootDir, m.mutant.Pkg()))
+	status, store := m.adjudicate(rootDir, workingDir)
+	m.mutant.SetStatus(status)
 
 	if err := m.mutant.Rollback(); err != nil {
 		// What should we do now?
 		log.Errorf("failed to restore mutation at %s - %s\n\t%v", m.mutant.Position(), m.mutant.Status(), err)
+	} else if store != nil {
+		store()
 	}
 
 	m.outCh <- m.mutant
+}
+
+// adjudicate returns the applied mutant's verdict: from the cache when a valid
+// entry exists, otherwise from its tests. When the cache may keep the verdict
+// it also returns the call that stores it, which Start makes once the mutation
+// is rolled back, so the entry's digests describe the copy the test ran in
+// without the mutation.
+func (m *mutantExecutor) adjudicate(rootDir, workingDir string) (mutator.Status, func()) {
+	env := m.childEnv()
+	if m.cache == nil {
+		status, _ := m.runTests(rootDir, m.mutant.Pkg(), env, nil)
+
+		return status, nil
+	}
+
+	file := filepath.Join(workingDir, m.mutant.Position().Filename)
+	key, err := m.cacheKey(file)
+	if err != nil {
+		log.Errorf("verdict cache: no key for %s: %v\n", m.mutant.Position(), err)
+		status, _ := m.runTests(rootDir, m.mutant.Pkg(), env, nil)
+
+		return status, nil
+	}
+	if status, ok := m.cache.Lookup(key, env); ok {
+		return status, nil
+	}
+
+	files, err := newCacheFiles(m.wdDealer.WorkDir())
+	if err != nil {
+		log.Errorf("verdict cache: no test log for %s: %v\n", m.mutant.Position(), err)
+		status, _ := m.runTests(rootDir, m.mutant.Pkg(), env, nil)
+
+		return status, nil
+	}
+	status, ev := m.runTests(rootDir, m.mutant.Pkg(), env, files)
+	ev.WorkRoot = rootDir
+	ev.PkgDir = filepath.Dir(file)
+	ev.ScratchRoot = m.wdDealer.WorkDir()
+
+	return status, func() {
+		defer files.remove()
+		if _, err := m.cache.Store(key, m.mutant.Pkg(), status, ev); err != nil {
+			log.Errorf("verdict cache: cannot store %s: %v\n", m.mutant.Position(), err)
+		}
+	}
+}
+
+// diagnosticMarkers are the starts of a compiler diagnostic line for the
+// mutated file: its path as the go command prints it, relative to the
+// directory `go test` runs in (with or without a leading "./"), or absolute,
+// each anchored at the start of a line so that another file whose name ends
+// the same way does not match. A build failure that names the
+// file is the mutation's; one that does not, such as a killed compiler or a
+// full disk, is the environment's.
+func (m *mutantExecutor) diagnosticMarkers() []string {
+	file := filepath.Join(m.mutant.Workdir(), m.mutant.Position().Filename)
+	markers := []string{"\n" + file + ":"}
+	if rel, err := filepath.Rel(m.mutant.Workdir(), file); err == nil {
+		markers = append(markers, "\n"+rel+":", "\n./"+rel+":")
+	}
+
+	return markers
+}
+
+// buildFailedOnMutation reports whether the output scanned by s is a build
+// failure with a compiler diagnostic that starts with one of diagnostics, and
+// no setup failure: the only build failure a one-token mutation can cause.
+func buildFailedOnMutation(s *outputScanner, diagnostics []string) bool {
+	return s.saw(buildFailureMarker) && !s.saw(setupFailureMarker) && slices.ContainsFunc(diagnostics, s.saw)
+}
+
+// cacheFiles are the two files a cached run's test binary writes: its test
+// log, and the memory profile whose presence proves the log is complete.
+type cacheFiles struct {
+	testlog, seal string
+}
+
+func newCacheFiles(dir string) (*cacheFiles, error) {
+	f := &cacheFiles{}
+	for _, p := range []*string{&f.testlog, &f.seal} {
+		tmp, err := os.CreateTemp(dir, "testlog-*")
+		if err != nil {
+			f.remove()
+
+			return nil, err
+		}
+		_ = tmp.Close()
+		*p = tmp.Name()
+	}
+
+	return f, nil
+}
+
+func (f *cacheFiles) remove() {
+	for _, p := range []string{f.testlog, f.seal} {
+		if p != "" {
+			_ = os.Remove(p)
+		}
+	}
+}
+
+// sealed reports whether the test binary wrote its memory profile, which
+// testing.M does only after it has flushed and closed the test log.
+func (f *cacheFiles) sealed() bool {
+	info, err := os.Stat(f.seal)
+
+	return err == nil && info.Size() > 0
+}
+
+func (m *mutantExecutor) cacheKey(file string) (string, error) {
+	//nolint:gosec // the mutated file gremlins itself just wrote
+	mutated, err := os.ReadFile(file)
+	if err != nil {
+		return "", err
+	}
+	pos := m.mutant.Position()
+
+	return m.cache.Key(m.mutant.Pkg(), m.module.ModulePath(pos.Filename), m.mutant.Type(), pos.Line, pos.Column, mutated)
+}
+
+// childEnv is the environment a mutant's `go test` is given.
+func (m *mutantExecutor) childEnv() []string {
+	return append(os.Environ(), fmt.Sprintf("GOTMPDIR=%s", m.wdDealer.WorkDir()))
 }
 
 // runTests runs the mutated package's tests and classifies the outcome.
@@ -364,21 +540,30 @@ func (m *mutantExecutor) Start(w *workerpool.Worker) {
 // produced it. mutator.TimedOut is that absence, and it must stay separate
 // precisely because a compile that hung reaches it identically to a run that
 // did.
-func (m *mutantExecutor) runTests(rootDir, pkg string) mutator.Status {
+//
+// Non-nil files are handed to the test binary as -test.testlogfile and
+// -test.memprofile. The returned cache.Evidence says what the run proved about
+// its own verdict.
+func (m *mutantExecutor) runTests(rootDir, pkg string, env []string, files *cacheFiles) (mutator.Status, cache.Evidence) {
 	ctx, cancel := context.WithTimeout(m.runCtx, m.testExecutionTime+m.compileAllowance)
 	defer cancel()
 
-	cmd := m.execContext(ctx, "go", m.getTestArgs(pkg)...)
+	args := m.getTestArgs(pkg)
+	if files != nil {
+		args = append(args, "-args", "-test.testlogfile="+files.testlog, "-test.memprofile="+files.seal)
+	}
+	cmd := m.execContext(ctx, "go", args...)
 	cmd.Dir = m.mutant.Workdir()
 	if m.integrationMode {
 		cmd.Dir = rootDir
 	}
-	cmd.Env = append(cmd.Env, os.Environ()...)
-	cmd.Env = append(cmd.Env, fmt.Sprintf("GOTMPDIR=%s", m.wdDealer.WorkDir()))
+	cmd.Env = append(cmd.Env, env...)
+	ev := cache.Evidence{Env: cmd.Env}
 
 	// The output is scanned, never retained: a runaway mutant can print without
 	// bound, and buffering that would trade one resource exhaustion for another.
-	scanner := newOutputScanner()
+	diagnostics := m.diagnosticMarkers()
+	scanner := newOutputScanner(diagnostics...)
 	cmd.Stdout = scanner
 	cmd.Stderr = scanner
 	cmd.WaitDelay = outputDrainGrace
@@ -387,6 +572,10 @@ func (m *mutantExecutor) runTests(rootDir, pkg string) mutator.Status {
 	setupProcessGroup(cmd)
 
 	err := run(ctx, cmd)
+	if files != nil {
+		ev.Testlog = files.testlog
+		ev.LogComplete = files.sealed()
+	}
 
 	// The run-phase watchdog is read before either deadline, because it is
 	// evidence and they are the lack of it. Two things follow from that order.
@@ -404,13 +593,13 @@ func (m *mutantExecutor) runTests(rootDir, pkg string) mutator.Status {
 	// and a deadline-killed child returns the context's error, so no real timeout
 	// is lost to the guard.
 	if err != nil && scanner.sawTestTimeout() {
-		return mutator.RunTimedOut
+		return mutator.RunTimedOut, ev
 	}
 	// The backstop bounds compile AND run together, so when it is what fired we
 	// do not know which phase spent it. Unadjudicated: it stays in the efficacy
 	// denominator and credits nobody.
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return mutator.TimedOut
+		return mutator.TimedOut, ev
 	}
 	// If the parent runCtx was cancelled (Ctrl-C or runner SIGTERM) the
 	// `go test` child was killed before reaching a verdict. Reporting
@@ -418,7 +607,7 @@ func (m *mutantExecutor) runTests(rootDir, pkg string) mutator.Status {
 	// The configured shutdown status (default NotCovered) is the truthful
 	// outcome.
 	if m.runCtx.Err() != nil {
-		return shutdownStatus()
+		return shutdownStatus(), ev
 	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
@@ -428,14 +617,24 @@ func (m *mutantExecutor) runTests(rootDir, pkg string) mutator.Status {
 		// package failed to build and another timed out. RUN TIMED OUT is the
 		// safe verdict there, because NOT VIABLE would drop the mutant out of
 		// the denominator altogether.
+		ev.Adjudicated = true
 		if scanner.sawBuildFailure() {
-			return mutator.NotViable
+			ev.BuildFailed = buildFailedOnMutation(scanner, diagnostics)
+
+			return mutator.NotViable, ev
 		}
 
-		return getTestFailedStatus(exitErr.ExitCode())
+		return getTestFailedStatus(exitErr.ExitCode()), ev
 	}
+	if err != nil {
+		// The child could not be started or waited for: nothing adjudicated
+		// the mutant, and this branch keeps the status it always had.
+		return mutator.Lived, ev
+	}
+	ev.Adjudicated = true
+	ev.ExitedZero = true
 
-	return mutator.Lived
+	return mutator.Lived, ev
 }
 
 // outputScanner is an io.Writer that watches a stream for fixed markers and
@@ -443,24 +642,27 @@ func (m *mutantExecutor) runTests(rootDir, pkg string) mutator.Status {
 // across two writes, so its memory use is constant however much the child
 // prints.
 type outputScanner struct {
-	mu    sync.Mutex
-	tail  string
-	seen  map[string]bool
-	carry int
+	mu      sync.Mutex
+	tail    string
+	seen    map[string]bool
+	carry   int
+	markers []string
 }
 
 // scannedMarkers are the substrings outputScanner looks for.
 var scannedMarkers = []string{testTimeoutMarker, buildFailureMarker, setupFailureMarker}
 
-func newOutputScanner() *outputScanner {
+// newOutputScanner watches for scannedMarkers and for each of extra.
+func newOutputScanner(extra ...string) *outputScanner {
+	markers := append(append([]string{}, scannedMarkers...), extra...)
 	carry := 0
-	for _, marker := range scannedMarkers {
+	for _, marker := range markers {
 		if len(marker) > carry {
 			carry = len(marker)
 		}
 	}
 
-	return &outputScanner{seen: make(map[string]bool, len(scannedMarkers)), carry: carry - 1}
+	return &outputScanner{seen: make(map[string]bool, len(markers)), carry: carry - 1, markers: markers}
 }
 
 func (s *outputScanner) Write(p []byte) (int, error) {
@@ -468,7 +670,7 @@ func (s *outputScanner) Write(p []byte) (int, error) {
 	defer s.mu.Unlock()
 
 	window := s.tail + string(p)
-	for _, marker := range scannedMarkers {
+	for _, marker := range s.markers {
 		if strings.Contains(window, marker) {
 			s.seen[marker] = true
 		}
