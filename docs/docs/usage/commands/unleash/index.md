@@ -591,7 +591,7 @@ gremlins unleash --cache-dir="$HOME/.cache/gremlins" --cache-salt="$(sha256sum w
 :material-flag: `--cache-env-ignore` · :material-sign-direction: Default: `[]`
 
 Environment variables left out of every cache key, each a name or a prefix
-ending in `*`. Because the key holds the whole environment, a variable whose
+ending in `*`, as a comma-separated list. The flag can also be repeated. Because the key holds the whole environment, a variable whose
 value changes on every run, such as a CI system's run or job identifier
 (`GITHUB_RUN_ID`, `CI_JOB_ID`), makes every lookup miss until it is listed
 here. List only variables that nothing reads before a test starts: a test's own
