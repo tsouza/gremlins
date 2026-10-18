@@ -162,7 +162,7 @@ func cleanUp(wd string) {
 }
 
 func run(ctx context.Context, mod gomodule.GoModule, workDir string) (report.Results, error) {
-	fDiff, err := diff.New()
+	fDiff, err := diff.New(mod.Root)
 	if err != nil {
 		return report.Results{}, err
 	}
